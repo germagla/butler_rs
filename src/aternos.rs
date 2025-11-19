@@ -11,8 +11,11 @@ pub async fn start(username: &str, password: &str) -> Result<String> {
     args.push(OsStr::new("--window-size=1920,1080"));
     args.push(OsStr::new("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
 
+    let headless = std::env::var("HEADLESS").unwrap_or_else(|_| "true".to_string()) != "false";
+    println!("DEBUG: HEADLESS env var is set to: {:?}, resulting in headless={}", std::env::var("HEADLESS"), headless);
+    
     let options = LaunchOptions {
-        headless: true,
+        headless,
         args: args,
         ..Default::default()
     };
@@ -106,6 +109,7 @@ pub async fn start(username: &str, password: &str) -> Result<String> {
             println!("🔄 Start attempt {}/{}", attempt, max_retries);
 
             // 1. Check server status and Start button visibility
+            // Return JSON string to avoid parsing issues with complex objects
             let state_check = tab.evaluate(r#"
                 (function() {
                     const status = document.querySelector('.statuslabel-label');
@@ -114,14 +118,16 @@ pub async fn start(username: &str, password: &str) -> Result<String> {
                     const statusText = status ? status.innerText.trim() : 'unknown';
                     const btnDisplay = startBtn ? window.getComputedStyle(startBtn).display : 'unknown';
                     
-                    return {
+                    return JSON.stringify({
                         status: statusText,
                         btn_display: btnDisplay
-                    };
+                    });
                 })()
             "#, false)?;
             
-            let state_val = state_check.value.as_ref().expect("Failed to get state value");
+            let state_json = state_check.value.as_ref().and_then(|v| v.as_str()).unwrap_or("{}");
+            let state_val: serde_json::Value = serde_json::from_str(state_json).unwrap_or(serde_json::json!({}));
+            
             let status_text = state_val.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
             let btn_display = state_val.get("btn_display").and_then(|v| v.as_str()).unwrap_or("unknown");
 
@@ -259,4 +265,169 @@ pub async fn start(username: &str, password: &str) -> Result<String> {
             Err(e)
         }
     }
+}
+
+pub async fn get_minecraft_status(addr: &str) -> Result<String> {
+    use regex::Regex;
+
+    // Parse initial address
+    let parts: Vec<&str> = addr.split(':').collect();
+    let mut current_host = parts[0].to_string();
+    let mut current_port = if parts.len() > 1 {
+        parts[1].parse().unwrap_or(25565)
+    } else {
+        25565
+    };
+
+    // Allow up to 1 redirect
+    for _ in 0..2 {
+        println!("Pinging Minecraft server at {}:{}", current_host, current_port);
+
+        let mut ping_result = Err(anyhow::anyhow!("Ping failed"));
+        
+        // Retry loop for the ping itself
+        for attempt in 1..=3 {
+            if attempt > 1 {
+                println!("Retrying ping (attempt {}/3)...", attempt);
+                sleep(Duration::from_millis(1000));
+            }
+
+            let timeout = Duration::from_secs(5);
+            let result = tokio::time::timeout(timeout, async {
+                let mut stream = tokio::net::TcpStream::connect((current_host.as_str(), current_port)).await?;
+                let response = craftping::tokio::ping(&mut stream, current_host.as_str(), current_port).await?;
+                Ok::<craftping::Response, anyhow::Error>(response)
+            }).await;
+            
+            if let Ok(inner_res) = result {
+                ping_result = Ok(inner_res);
+                if ping_result.as_ref().unwrap().is_ok() {
+                    break;
+                }
+            }
+        }
+
+        match ping_result {
+            Ok(Ok(response)) => {
+                println!("Ping success: {:?}", response);
+                
+                // Extract text from description
+                let description_text;
+                if let Some(serde_json::Value::Object(map)) = &response.description {
+                    if let Some(serde_json::Value::String(text)) = map.get("text") {
+                        description_text = text.clone();
+                    } else if let Some(serde_json::Value::Object(_extra)) = map.get("extra") {
+                        description_text = serde_json::to_string(&response.description).unwrap_or_default();
+                    } else {
+                         description_text = serde_json::to_string(&response.description).unwrap_or_default();
+                    }
+                } else if let Some(serde_json::Value::String(text)) = &response.description {
+                    description_text = text.clone();
+                } else {
+                    description_text = serde_json::to_string(&response.description).unwrap_or_default();
+                }
+
+                println!("Raw description text: {}", description_text);
+
+                // Clean color codes (section sign + char)
+                let re_color = Regex::new(r"§.").unwrap();
+                let clean_text = re_color.replace_all(&description_text, "");
+                println!("Cleaned description text: {}", clean_text);
+
+                // Check for explicit status indicators in version or description
+                let lower_version = response.version.to_lowercase();
+                let lower_desc = clean_text.to_lowercase();
+
+                if lower_version.contains("offline") || lower_desc.contains("offline") {
+                    println!("Detected 'Offline' indicator.");
+                    return Ok("Offline".to_string());
+                }
+
+                if lower_version.contains("starting") || lower_desc.contains("starting") {
+                     println!("Detected 'Starting' indicator.");
+                     return Ok("Starting".to_string());
+                }
+
+                if lower_version.contains("loading") || lower_desc.contains("loading") {
+                     println!("Detected 'Loading' indicator.");
+                     return Ok("Loading".to_string());
+                }
+
+                if lower_version.contains("queue") || lower_desc.contains("queue") {
+                     println!("Detected 'Queue' indicator.");
+                     return Ok("In Queue".to_string());
+                }
+
+                if lower_version.contains("preparing") || lower_desc.contains("preparing") {
+                     println!("Detected 'Preparing' indicator.");
+                     return Ok("Preparing".to_string());
+                }
+                
+                // Regex for "host:port" (e.g. dynip)
+                let re_host_port = Regex::new(r"([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):(\d{4,5})").unwrap();
+                // Regex for "Port: 12345"
+                let re_port_only = Regex::new(r"[Pp]ort:?\s*(\d{4,5})").unwrap();
+
+                let mut redirect_found = false;
+
+                if let Some(caps) = re_host_port.captures(&clean_text) {
+                    let new_host = caps.get(1).unwrap().as_str().to_string();
+                    let new_port = caps.get(2).unwrap().as_str().parse::<u16>().unwrap_or(0);
+                    
+                    if new_port != 0 && (new_host != current_host || new_port != current_port) {
+                        println!("Redirection detected to {}:{}", new_host, new_port);
+                        current_host = new_host;
+                        current_port = new_port;
+                        redirect_found = true;
+                    }
+                } else if let Some(caps) = re_port_only.captures(&clean_text) {
+                    let new_port = caps.get(1).unwrap().as_str().parse::<u16>().unwrap_or(0);
+                    if new_port != 0 && new_port != current_port {
+                        println!("Port redirection detected to {}", new_port);
+                        current_port = new_port;
+                        redirect_found = true;
+                    }
+                }
+
+                if redirect_found {
+                    continue; // Retry with new address
+                }
+
+                // No redirect, return result
+                let players: Vec<String> = response.sample
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
+                
+                let player_list = if players.is_empty() {
+                    "None".to_string()
+                } else {
+                    players.join(", ")
+                };
+
+                return Ok(format!(
+                    "Online ({}/{} players)\nPlayers: {}", 
+                    response.online_players, 
+                    response.max_players,
+                    player_list
+                ));
+            },
+            Ok(Err(e)) => {
+                println!("Ping failed: {}", e);
+                // Only return offline if we are on the last redirect attempt or if it's a hard failure
+                // But here we are inside the redirect loop.
+                // If it fails, we might want to try the next redirect loop iteration? 
+                // No, if ping fails, we can't read description to find redirect.
+                // So we just return Offline.
+                return Ok("Offline (Unreachable)".to_string());
+            },
+            Err(_) => {
+                println!("Ping timed out after retries");
+                return Ok("Offline (Timeout)".to_string());
+            }
+        }
+    }
+
+    Ok("Offline (Max redirects reached)".to_string())
 }

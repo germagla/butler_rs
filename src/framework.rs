@@ -6,7 +6,11 @@ pub type Context<'a> = poise::Context<'a, BotState, anyhow::Error>;
 pub fn create_framework() -> poise::Framework<BotState, anyhow::Error> {
     poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![commands::ping::ping(), commands::aternos::start_aternos()],
+            commands: vec![
+                commands::ping::ping(),
+                commands::aternos::aternos_start(),
+                commands::aternos::aternos_status(),
+            ],
             ..Default::default()
         })
         .setup(|ctx, _ready, framework| {

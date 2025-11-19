@@ -12,3 +12,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 dotenvy = "0.15"
 anyhow = "1"
 rand = "0.8"
+craftping = { version = "0.7", features = ["async-tokio"] }
+serde_json = "1.0"
+regex = "1"

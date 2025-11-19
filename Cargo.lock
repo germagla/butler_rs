@@ -116,11 +116,14 @@ name = "butler_rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "craftping",
  "dotenvy",
  "headless_chrome",
  "poise",
  "rand 0.8.5",
+ "regex",
  "serde",
+ "serde_json",
  "serenity",
  "tokio",
 ]
@@ -231,6 +234,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "craftping"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02434d58254bc0314d6519413a42c52e51ca2f358b698454d5495ae4775da966"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
