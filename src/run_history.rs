@@ -58,14 +58,23 @@ pub struct RunStore {
     inner: Arc<Mutex<VecDeque<RunSummary>>>,
     limit: usize,
     event_file: Arc<PathBuf>,
+    persist_events: bool,
+    redact_events: bool,
 }
 
 impl RunStore {
-    pub fn new(limit: usize, artifact_dir: &Path) -> Self {
+    pub fn new(
+        limit: usize,
+        artifact_dir: &Path,
+        persist_events: bool,
+        redact_events: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(limit))),
             limit,
             event_file: Arc::new(artifact_dir.join("events.jsonl")),
+            persist_events,
+            redact_events,
         }
     }
 
@@ -97,6 +106,10 @@ impl RunStore {
     }
 
     pub fn append_event(&self, event: &RunEvent) -> Result<()> {
+        if !self.persist_events {
+            return Ok(());
+        }
+
         if let Some(parent) = self.event_file.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -105,8 +118,30 @@ impl RunStore {
             .create(true)
             .append(true)
             .open(self.event_file.as_ref())?;
-        writeln!(file, "{}", serde_json::to_string(event)?)?;
+        let event = if self.redact_events {
+            event.redacted()
+        } else {
+            event.clone()
+        };
+        writeln!(file, "{}", serde_json::to_string(&event)?)?;
         Ok(())
+    }
+}
+
+impl RunEvent {
+    fn redacted(&self) -> Self {
+        let mut context = self.context.clone();
+        context.guild_id = None;
+        context.guild_name = "redacted".to_string();
+        context.channel_id = "redacted".to_string();
+        context.channel_name = None;
+        context.user_id = "redacted".to_string();
+        context.user_name = "redacted".to_string();
+
+        Self {
+            context,
+            step: self.step.clone(),
+        }
     }
 }
 

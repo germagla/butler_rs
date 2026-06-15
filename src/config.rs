@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::{env, path::PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub discord_token: String,
     pub aternos_user: String,
@@ -12,6 +12,8 @@ pub struct Config {
     pub start_wait_online_secs: u64,
     pub run_history_limit: usize,
     pub artifact_dir: PathBuf,
+    pub persist_run_events: bool,
+    pub redact_run_events: bool,
 }
 
 impl Config {
@@ -34,6 +36,8 @@ impl Config {
             artifact_dir: PathBuf::from(
                 env::var("ARTIFACT_DIR").unwrap_or_else(|_| "artifacts/runs".to_string()),
             ),
+            persist_run_events: bool_var("BUTLER_PERSIST_RUN_EVENTS", true),
+            redact_run_events: bool_var("BUTLER_REDACT_RUN_EVENTS", true),
         })
     }
 }

@@ -10,7 +10,12 @@ pub struct BotState {
 
 impl BotState {
     pub fn new(config: Config) -> Self {
-        let run_store = RunStore::new(config.run_history_limit, &config.artifact_dir);
+        let run_store = RunStore::new(
+            config.run_history_limit,
+            &config.artifact_dir,
+            config.persist_run_events,
+            config.redact_run_events,
+        );
         Self {
             config: Arc::new(config),
             run_store,

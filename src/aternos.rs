@@ -9,6 +9,31 @@ use std::{
     time::Duration,
 };
 
+const ATERNOS_LOGIN_URL: &str = "https://aternos.org/go/";
+const ATERNOS_SERVER_URL: &str = "https://aternos.org/server/";
+const START_BUTTON_SELECTOR: &str = "#start";
+const USERNAME_SELECTOR: &str = ".username";
+const PASSWORD_SELECTOR: &str = ".password";
+const LOGIN_BUTTON_SELECTOR: &str = ".login-button";
+const DASHBOARD_SUCCESS_SCREENSHOT: &str = "dashboard_after_start.png";
+const DASHBOARD_SUCCESS_HTML: &str = "dashboard_after_start.html";
+const FAILURE_SCREENSHOT: &str = "failure.png";
+const FAILURE_HTML: &str = "failure.html";
+const BROWSER_WINDOW_SIZE: &str = "--window-size=1920,1080";
+const BROWSER_USER_AGENT: &str = "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const START_RETRY_ATTEMPTS: usize = 5;
+const PAGE_SETTLE_SECS: u64 = 2;
+const START_CLICK_SETTLE_MS: u64 = 500;
+const START_ACCEPT_WAIT_SECS: u64 = 5;
+const DIALOG_SETTLE_SECS: u64 = 3;
+const BLOCKER_DISMISS_ATTEMPTS: usize = 3;
+const BLOCKER_SETTLE_SECS: u64 = 1;
+const ESCAPE_SETTLE_MS: u64 = 300;
+const OVERLAY_CLICK_SETTLE_MS: u64 = 500;
+const FINAL_CAPTURE_SETTLE_MS: u64 = 500;
+const RANDOM_DELAY_MIN_MS: u64 = 500;
+const RANDOM_DELAY_MAX_MS: u64 = 1500;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartOutcome {
     StartClicked,
@@ -48,26 +73,36 @@ impl std::fmt::Display for BrowserStartFailure {
 
 impl std::error::Error for BrowserStartFailure {}
 
-pub async fn start_browser(
-    config: &Config,
-    run_id: &str,
-) -> Result<BrowserStartResult, BrowserStartFailure> {
-    let username = config.aternos_user.clone();
-    let password = config.aternos_pass.clone();
-    let server_id = config.server_id.clone();
-    let headless = config.headless;
-    let run_dir = config.artifact_dir.join(run_id);
+/// Browser-backed Aternos integration adapter.
+///
+/// The rest of the bot treats this as a server start provider. A future HTTP or
+/// first-party provider should preserve this result/error contract instead of
+/// leaking provider-specific details into command handling.
+pub struct BrowserAternosProvider;
 
-    tokio::task::spawn_blocking(move || {
-        run_browser_start(username, password, server_id, headless, run_dir)
-    })
-    .await
-    .map_err(|error| BrowserStartFailure {
-        error_class: "BrowserThreadJoin".to_string(),
-        message: error.to_string(),
-        screenshot_path: None,
-        html_path: None,
-    })?
+impl BrowserAternosProvider {
+    pub async fn start(
+        &self,
+        config: &Config,
+        run_id: &str,
+    ) -> Result<BrowserStartResult, BrowserStartFailure> {
+        let username = config.aternos_user.clone();
+        let password = config.aternos_pass.clone();
+        let server_id = config.server_id.clone();
+        let headless = config.headless;
+        let run_dir = config.artifact_dir.join(run_id);
+
+        tokio::task::spawn_blocking(move || {
+            run_browser_start(username, password, server_id, headless, run_dir)
+        })
+        .await
+        .map_err(|error| BrowserStartFailure {
+            error_class: "BrowserThreadJoin".to_string(),
+            message: error.to_string(),
+            screenshot_path: None,
+            html_path: None,
+        })?
+    }
 }
 
 fn run_browser_start(
@@ -87,10 +122,8 @@ fn run_browser_start(
     let args = vec![
         OsStr::new("--disable-blink-features=AutomationControlled"),
         OsStr::new("--disable-notifications"),
-        OsStr::new("--window-size=1920,1080"),
-        OsStr::new(
-            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
+        OsStr::new(BROWSER_WINDOW_SIZE),
+        OsStr::new(BROWSER_USER_AGENT),
     ];
 
     let options = LaunchOptions {
@@ -115,8 +148,8 @@ fn run_browser_start(
     match run_dashboard_flow(&tab, &username, &password, server_id.as_deref(), &run_dir) {
         Ok(result) => Ok(result),
         Err(error) => {
-            let screenshot_path = capture_screenshot(&tab, &run_dir, "failure.png").ok();
-            let html_path = capture_html(&tab, &run_dir, "failure.html").ok();
+            let screenshot_path = capture_screenshot(&tab, &run_dir, FAILURE_SCREENSHOT).ok();
+            let html_path = capture_html(&tab, &run_dir, FAILURE_HTML).ok();
             Err(BrowserStartFailure {
                 error_class: classify_browser_error(&error),
                 message: error.to_string(),
@@ -134,29 +167,29 @@ fn run_dashboard_flow(
     server_id: Option<&str>,
     run_dir: &Path,
 ) -> Result<BrowserStartResult> {
-    tab.navigate_to("https://aternos.org/go/")?;
+    tab.navigate_to(ATERNOS_LOGIN_URL)?;
     random_delay();
-    sleep(Duration::from_secs(2));
+    sleep(Duration::from_secs(PAGE_SETTLE_SECS));
     click_cookie_consent(tab)?;
     dismiss_notification_prompt(tab)?;
     dismiss_page_blockers(tab)?;
     random_delay();
     fail_if_challenge_present(tab)?;
 
-    let user_field = tab.wait_for_element(".username")?;
+    let user_field = tab.wait_for_element(USERNAME_SELECTOR)?;
     random_delay();
     user_field.click()?;
     random_delay();
     user_field.type_into(username)?;
     random_delay();
 
-    let pass_field = tab.wait_for_element(".password")?;
+    let pass_field = tab.wait_for_element(PASSWORD_SELECTOR)?;
     pass_field.click()?;
     random_delay();
     pass_field.type_into(password)?;
     random_delay();
 
-    tab.wait_for_element(".login-button")?.click()?;
+    tab.wait_for_element(LOGIN_BUTTON_SELECTOR)?.click()?;
     random_delay();
     dismiss_page_blockers(tab)?;
     fail_if_challenge_present(tab)?;
@@ -170,8 +203,8 @@ fn run_dashboard_flow(
     }
 
     random_delay();
-    tab.navigate_to("https://aternos.org/server/")?;
-    tab.wait_for_element("#start")?;
+    tab.navigate_to(ATERNOS_SERVER_URL)?;
+    tab.wait_for_element(START_BUTTON_SELECTOR)?;
     dismiss_notification_prompt(tab)?;
     dismiss_page_blockers(tab)?;
     fail_if_challenge_present(tab)?;
@@ -180,7 +213,7 @@ fn run_dashboard_flow(
     let mut dashboard_status = dashboard_status(tab)?;
     let mut accepted = false;
 
-    for _ in 1..=5 {
+    for _ in 1..=START_RETRY_ATTEMPTS {
         dismiss_page_blockers(tab)?;
         fail_if_challenge_present(tab)?;
         let state = dashboard_state(tab)?;
@@ -193,18 +226,18 @@ fn run_dashboard_flow(
 
         if state.start_button_visible {
             scroll_start_into_view(tab)?;
-            sleep(Duration::from_millis(500));
-            if let Ok(button) = tab.find_element("#start") {
+            sleep(Duration::from_millis(START_CLICK_SETTLE_MS));
+            if let Ok(button) = tab.find_element(START_BUTTON_SELECTOR) {
                 button.click()?;
                 start_clicked = true;
             }
         }
 
-        sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(START_ACCEPT_WAIT_SECS));
         dismiss_notification_prompt(tab)?;
         dismiss_page_blockers(tab)?;
         click_known_dialogs(tab)?;
-        sleep(Duration::from_secs(3));
+        sleep(Duration::from_secs(DIALOG_SETTLE_SECS));
         dismiss_notification_prompt(tab)?;
         dismiss_page_blockers(tab)?;
 
@@ -239,10 +272,10 @@ fn run_dashboard_flow(
     }
 
     dismiss_notification_prompt(tab)?;
-    sleep(Duration::from_millis(500));
+    sleep(Duration::from_millis(FINAL_CAPTURE_SETTLE_MS));
 
-    let screenshot_path = capture_screenshot(tab, run_dir, "dashboard_after_start.png").ok();
-    let html_path = capture_html(tab, run_dir, "dashboard_after_start.html").ok();
+    let screenshot_path = capture_screenshot(tab, run_dir, DASHBOARD_SUCCESS_SCREENSHOT).ok();
+    let html_path = capture_html(tab, run_dir, DASHBOARD_SUCCESS_HTML).ok();
 
     Ok(BrowserStartResult {
         outcome: if start_clicked {
@@ -430,14 +463,14 @@ fn click_known_dialogs(tab: &headless_chrome::Tab) -> Result<()> {
 }
 
 fn dismiss_page_blockers(tab: &headless_chrome::Tab) -> Result<()> {
-    for _ in 0..3 {
+    for _ in 0..BLOCKER_DISMISS_ATTEMPTS {
         let dismissed_adblock = dismiss_adblock_prompt(tab)?;
         dismiss_notification_prompt(tab)?;
         click_known_dialogs(tab)?;
 
         if visible_ad_overlay_present(tab)? {
             click_rewarded_ad_close(tab)?;
-            sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(BLOCKER_SETTLE_SECS));
         }
 
         if !dismissed_adblock && !visible_ad_overlay_present(tab)? {
@@ -573,7 +606,7 @@ fn click_rewarded_ad_close(tab: &headless_chrome::Tab) -> Result<()> {
         .unwrap_or(937.0);
 
     tab.press_key("Escape")?;
-    sleep(Duration::from_millis(300));
+    sleep(Duration::from_millis(ESCAPE_SETTLE_MS));
 
     for point in [
         Point {
@@ -590,7 +623,7 @@ fn click_rewarded_ad_close(tab: &headless_chrome::Tab) -> Result<()> {
         },
     ] {
         tab.click_point(point)?;
-        sleep(Duration::from_millis(500));
+        sleep(Duration::from_millis(OVERLAY_CLICK_SETTLE_MS));
         if !visible_ad_overlay_present(tab)? {
             break;
         }
@@ -694,6 +727,6 @@ fn classify_browser_error(error: &anyhow::Error) -> String {
 
 fn random_delay() {
     let mut rng = rand::thread_rng();
-    let delay = rng.gen_range(500..1500);
+    let delay = rng.gen_range(RANDOM_DELAY_MIN_MS..RANDOM_DELAY_MAX_MS);
     sleep(Duration::from_millis(delay));
 }

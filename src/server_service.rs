@@ -48,13 +48,19 @@ pub async fn start_server_with_notice(
     }
 
     if !data.begin_start_run(&context.run_id).await {
+        let active_run_id = data
+            .active_start_run_id()
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
         terminal::emit(terminal::line_for_context(
             "BUSY",
             &context,
-            "start lock already taken",
+            format!("{active_run_id} already running"),
         ));
         ctx.say(with_notice(
-            "A start operation began just now. Try `/bot runs` for the active run ID.".to_string(),
+            format!(
+                "A start operation began just now as `{active_run_id}`. Use `/bot run run_id:{active_run_id}` to inspect it after it finishes."
+            ),
             notice,
         ))
         .await?;
@@ -199,7 +205,10 @@ async fn start_server_inner(
             .await;
     }
 
-    match aternos::start_browser(&config, &tracker.context.run_id).await {
+    match aternos::BrowserAternosProvider
+        .start(&config, &tracker.context.run_id)
+        .await
+    {
         Ok(browser_result) => {
             handle_browser_success(
                 ctx,

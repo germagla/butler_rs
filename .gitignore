@@ -1,4 +1,13 @@
 /target
-.env*
+.env
+.env.*
+!.env.example
+artifacts/
+*.dump.html
 *dump.html
 *screenshot.png
+dashboard_after_start.html
+dashboard_after_start.png
+failure.html
+failure.png
+.DS_Store
