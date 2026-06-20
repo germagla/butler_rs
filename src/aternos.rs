@@ -1,6 +1,14 @@
-use crate::config::Config;
-use anyhow::{Result, anyhow};
-use headless_chrome::{Browser, LaunchOptions, browser::tab::point::Point};
+use crate::{
+    config::{ArtifactCapture, Config},
+    provider::{
+        ProviderStartFailure, ProviderStartFuture, ProviderStartResult, ServerStartProvider,
+        StartOutcome,
+    },
+    run_history::mark_run_artifact_dir,
+    terminal,
+};
+use anyhow::{Context, Result, anyhow};
+use headless_chrome::{Browser, Element, LaunchOptions, browser::tab::point::Point};
 use rand::Rng;
 use std::{
     ffi::OsStr,
@@ -34,45 +42,6 @@ const FINAL_CAPTURE_SETTLE_MS: u64 = 500;
 const RANDOM_DELAY_MIN_MS: u64 = 500;
 const RANDOM_DELAY_MAX_MS: u64 = 1500;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StartOutcome {
-    StartClicked,
-    DashboardChanged,
-}
-
-impl std::fmt::Display for StartOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StartClicked => write!(f, "StartClicked"),
-            Self::DashboardChanged => write!(f, "DashboardChanged"),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct BrowserStartResult {
-    pub outcome: StartOutcome,
-    pub dashboard_status: String,
-    pub screenshot_path: Option<PathBuf>,
-    pub html_path: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-pub struct BrowserStartFailure {
-    pub error_class: String,
-    pub message: String,
-    pub screenshot_path: Option<PathBuf>,
-    pub html_path: Option<PathBuf>,
-}
-
-impl std::fmt::Display for BrowserStartFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.error_class, self.message)
-    }
-}
-
-impl std::error::Error for BrowserStartFailure {}
-
 /// Browser-backed Aternos integration adapter.
 ///
 /// The rest of the bot treats this as a server start provider. A future HTTP or
@@ -80,28 +49,34 @@ impl std::error::Error for BrowserStartFailure {}
 /// leaking provider-specific details into command handling.
 pub struct BrowserAternosProvider;
 
-impl BrowserAternosProvider {
-    pub async fn start(
-        &self,
-        config: &Config,
-        run_id: &str,
-    ) -> Result<BrowserStartResult, BrowserStartFailure> {
-        let username = config.aternos_user.clone();
-        let password = config.aternos_pass.clone();
-        let server_id = config.server_id.clone();
-        let headless = config.headless;
-        let run_dir = config.artifact_dir.join(run_id);
+impl ServerStartProvider for BrowserAternosProvider {
+    fn start<'a>(&'a self, config: &'a Config, run_id: &'a str) -> ProviderStartFuture<'a> {
+        Box::pin(async move {
+            let username = config.aternos_user.clone();
+            let password = config.aternos_pass.clone();
+            let server_id = config.server_id.clone();
+            let headless = config.headless;
+            let run_dir = config.artifact_dir.join(run_id);
+            let artifact_capture = config.artifact_capture;
 
-        tokio::task::spawn_blocking(move || {
-            run_browser_start(username, password, server_id, headless, run_dir)
+            tokio::task::spawn_blocking(move || {
+                run_browser_start(
+                    username,
+                    password,
+                    server_id,
+                    headless,
+                    run_dir,
+                    artifact_capture,
+                )
+            })
+            .await
+            .map_err(|error| ProviderStartFailure {
+                error_class: "BrowserThreadJoin".to_string(),
+                message: error.to_string(),
+                screenshot_path: None,
+                html_path: None,
+            })?
         })
-        .await
-        .map_err(|error| BrowserStartFailure {
-            error_class: "BrowserThreadJoin".to_string(),
-            message: error.to_string(),
-            screenshot_path: None,
-            html_path: None,
-        })?
     }
 }
 
@@ -111,14 +86,8 @@ fn run_browser_start(
     server_id: Option<String>,
     headless: bool,
     run_dir: PathBuf,
-) -> Result<BrowserStartResult, BrowserStartFailure> {
-    std::fs::create_dir_all(&run_dir).map_err(|error| BrowserStartFailure {
-        error_class: "ArtifactWrite".to_string(),
-        message: error.to_string(),
-        screenshot_path: None,
-        html_path: None,
-    })?;
-
+    artifact_capture: ArtifactCapture,
+) -> Result<ProviderStartResult, ProviderStartFailure> {
     let args = vec![
         OsStr::new("--disable-blink-features=AutomationControlled"),
         OsStr::new("--disable-notifications"),
@@ -132,25 +101,42 @@ fn run_browser_start(
         ..Default::default()
     };
 
-    let browser = Browser::new(options).map_err(|error| BrowserStartFailure {
+    let browser = Browser::new(options).map_err(|error| ProviderStartFailure {
         error_class: "BrowserLaunch".to_string(),
         message: error.to_string(),
         screenshot_path: None,
         html_path: None,
     })?;
-    let tab = browser.new_tab().map_err(|error| BrowserStartFailure {
+    let tab = browser.new_tab().map_err(|error| ProviderStartFailure {
         error_class: "BrowserTab".to_string(),
         message: error.to_string(),
         screenshot_path: None,
         html_path: None,
     })?;
 
-    match run_dashboard_flow(&tab, &username, &password, server_id.as_deref(), &run_dir) {
+    match run_dashboard_flow(
+        &tab,
+        &username,
+        &password,
+        server_id.as_deref(),
+        &run_dir,
+        artifact_capture,
+    ) {
         Ok(result) => Ok(result),
         Err(error) => {
-            let screenshot_path = capture_screenshot(&tab, &run_dir, FAILURE_SCREENSHOT).ok();
-            let html_path = capture_html(&tab, &run_dir, FAILURE_HTML).ok();
-            Err(BrowserStartFailure {
+            let screenshot_path = capture_screenshot_best_effort(
+                &tab,
+                &run_dir,
+                FAILURE_SCREENSHOT,
+                artifact_capture.capture_failure_screenshot(),
+            );
+            let html_path = capture_html_best_effort(
+                &tab,
+                &run_dir,
+                FAILURE_HTML,
+                artifact_capture.capture_failure_html(),
+            );
+            Err(ProviderStartFailure {
                 error_class: classify_browser_error(&error),
                 message: error.to_string(),
                 screenshot_path,
@@ -166,8 +152,10 @@ fn run_dashboard_flow(
     password: &str,
     server_id: Option<&str>,
     run_dir: &Path,
-) -> Result<BrowserStartResult> {
-    tab.navigate_to(ATERNOS_LOGIN_URL)?;
+    artifact_capture: ArtifactCapture,
+) -> Result<ProviderStartResult> {
+    tab.navigate_to(ATERNOS_LOGIN_URL)
+        .context("LoginPageUnavailable: could not open the Aternos login page")?;
     random_delay();
     sleep(Duration::from_secs(PAGE_SETTLE_SECS));
     click_cookie_consent(tab)?;
@@ -176,20 +164,36 @@ fn run_dashboard_flow(
     random_delay();
     fail_if_challenge_present(tab)?;
 
-    let user_field = tab.wait_for_element(USERNAME_SELECTOR)?;
+    let user_field = wait_for_browser_element(
+        tab,
+        USERNAME_SELECTOR,
+        "LoginFormUnavailable",
+        "username field was not available",
+    )?;
     random_delay();
     user_field.click()?;
     random_delay();
     user_field.type_into(username)?;
     random_delay();
 
-    let pass_field = tab.wait_for_element(PASSWORD_SELECTOR)?;
+    let pass_field = wait_for_browser_element(
+        tab,
+        PASSWORD_SELECTOR,
+        "LoginFormUnavailable",
+        "password field was not available",
+    )?;
     pass_field.click()?;
     random_delay();
     pass_field.type_into(password)?;
     random_delay();
 
-    tab.wait_for_element(LOGIN_BUTTON_SELECTOR)?.click()?;
+    wait_for_browser_element(
+        tab,
+        LOGIN_BUTTON_SELECTOR,
+        "LoginFormUnavailable",
+        "login button was not available",
+    )?
+    .click()?;
     random_delay();
     dismiss_page_blockers(tab)?;
     fail_if_challenge_present(tab)?;
@@ -203,8 +207,14 @@ fn run_dashboard_flow(
     }
 
     random_delay();
-    tab.navigate_to(ATERNOS_SERVER_URL)?;
-    tab.wait_for_element(START_BUTTON_SELECTOR)?;
+    tab.navigate_to(ATERNOS_SERVER_URL)
+        .context("DashboardUnavailable: could not open the Aternos dashboard")?;
+    wait_for_browser_element(
+        tab,
+        START_BUTTON_SELECTOR,
+        "DashboardUnavailable",
+        "dashboard controls did not load",
+    )?;
     dismiss_notification_prompt(tab)?;
     dismiss_page_blockers(tab)?;
     fail_if_challenge_present(tab)?;
@@ -274,10 +284,20 @@ fn run_dashboard_flow(
     dismiss_notification_prompt(tab)?;
     sleep(Duration::from_millis(FINAL_CAPTURE_SETTLE_MS));
 
-    let screenshot_path = capture_screenshot(tab, run_dir, DASHBOARD_SUCCESS_SCREENSHOT).ok();
-    let html_path = capture_html(tab, run_dir, DASHBOARD_SUCCESS_HTML).ok();
+    let screenshot_path = capture_screenshot_best_effort(
+        tab,
+        run_dir,
+        DASHBOARD_SUCCESS_SCREENSHOT,
+        artifact_capture.capture_success_screenshot(),
+    );
+    let html_path = capture_html_best_effort(
+        tab,
+        run_dir,
+        DASHBOARD_SUCCESS_HTML,
+        artifact_capture.capture_success_html(),
+    );
 
-    Ok(BrowserStartResult {
+    Ok(ProviderStartResult {
         outcome: if start_clicked {
             StartOutcome::StartClicked
         } else {
@@ -686,6 +706,84 @@ fn fail_if_challenge_present(tab: &headless_chrome::Tab) -> Result<()> {
     Ok(())
 }
 
+fn wait_for_browser_element<'a>(
+    tab: &'a headless_chrome::Tab,
+    selector: &str,
+    error_class: &str,
+    detail: &str,
+) -> Result<Element<'a>> {
+    tab.wait_for_element(selector)
+        .with_context(|| format!("{error_class}: {detail}"))
+}
+
+fn capture_screenshot_if(
+    tab: &headless_chrome::Tab,
+    run_dir: &Path,
+    filename: &str,
+    enabled: bool,
+) -> Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    capture_screenshot(tab, run_dir, filename)
+        .with_context(|| format!("ArtifactWrite: could not write screenshot {filename}"))
+        .map(Some)
+}
+
+fn capture_screenshot_best_effort(
+    tab: &headless_chrome::Tab,
+    run_dir: &Path,
+    filename: &str,
+    enabled: bool,
+) -> Option<PathBuf> {
+    artifact_capture_result_best_effort(
+        capture_screenshot_if(tab, run_dir, filename, enabled),
+        run_dir,
+        filename,
+    )
+}
+
+fn capture_html_if(
+    tab: &headless_chrome::Tab,
+    run_dir: &Path,
+    filename: &str,
+    enabled: bool,
+) -> Result<Option<PathBuf>> {
+    if !enabled {
+        return Ok(None);
+    }
+    capture_html(tab, run_dir, filename)
+        .with_context(|| format!("ArtifactWrite: could not write HTML {filename}"))
+        .map(Some)
+}
+
+fn capture_html_best_effort(
+    tab: &headless_chrome::Tab,
+    run_dir: &Path,
+    filename: &str,
+    enabled: bool,
+) -> Option<PathBuf> {
+    artifact_capture_result_best_effort(
+        capture_html_if(tab, run_dir, filename, enabled),
+        run_dir,
+        filename,
+    )
+}
+
+fn artifact_capture_result_best_effort(
+    result: Result<Option<PathBuf>>,
+    run_dir: &Path,
+    target: &str,
+) -> Option<PathBuf> {
+    match result {
+        Ok(path) => path,
+        Err(error) => {
+            emit_artifact_warning(run_dir, target, &error.to_string());
+            None
+        }
+    }
+}
+
 fn capture_screenshot(
     tab: &headless_chrome::Tab,
     run_dir: &Path,
@@ -694,6 +792,7 @@ fn capture_screenshot(
     use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 
     std::fs::create_dir_all(run_dir)?;
+    mark_run_dir_best_effort(run_dir);
     let path = run_dir.join(filename);
     let png_data = tab.capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)?;
     std::fs::write(&path, png_data)?;
@@ -702,10 +801,33 @@ fn capture_screenshot(
 
 fn capture_html(tab: &headless_chrome::Tab, run_dir: &Path, filename: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(run_dir)?;
+    mark_run_dir_best_effort(run_dir);
     let path = run_dir.join(filename);
     let content = tab.get_content()?;
     std::fs::write(&path, content)?;
     Ok(path)
+}
+
+fn mark_run_dir_best_effort(run_dir: &Path) {
+    if let Err(error) = mark_run_artifact_dir(run_dir) {
+        emit_artifact_warning(run_dir, ".butler-run", &error.to_string());
+    }
+}
+
+fn emit_artifact_warning(run_dir: &Path, target: &str, error: &str) {
+    terminal::emit(terminal::line(
+        "WARN",
+        "artifacts",
+        "",
+        "",
+        None,
+        format!(
+            "could not write {} in {}; error {}",
+            target,
+            run_dir.display(),
+            terminal::clean(error)
+        ),
+    ));
 }
 
 fn classify_browser_error(error: &anyhow::Error) -> String {
@@ -716,10 +838,14 @@ fn classify_browser_error(error: &anyhow::Error) -> String {
         .filter(|class| {
             matches!(
                 class.as_str(),
-                "ChallengeRequired"
+                "LoginPageUnavailable"
+                    | "LoginFormUnavailable"
+                    | "DashboardUnavailable"
+                    | "ChallengeRequired"
                     | "AdOverlayBlocked"
                     | "StartButtonUnavailable"
                     | "StartNotAccepted"
+                    | "ArtifactWrite"
             )
         })
         .unwrap_or_else(|| "BrowserAutomation".to_string())
@@ -729,4 +855,21 @@ fn random_delay() {
     let mut rng = rand::thread_rng();
     let delay = rng.gen_range(RANDOM_DELAY_MIN_MS..RANDOM_DELAY_MAX_MS);
     sleep(Duration::from_millis(delay));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_capture_errors_are_best_effort() {
+        let run_dir = std::env::temp_dir().join("butler_rs_best_effort");
+        let path = artifact_capture_result_best_effort(
+            Err(anyhow!("permission denied")),
+            &run_dir,
+            DASHBOARD_SUCCESS_SCREENSHOT,
+        );
+
+        assert_eq!(path, None);
+    }
 }

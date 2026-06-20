@@ -9,10 +9,12 @@ use tracing_subscriber::{
 };
 
 mod aternos;
+mod auth;
 mod commands;
 mod config;
 mod framework;
 mod minecraft;
+mod provider;
 mod run_history;
 mod server_service;
 mod state;
@@ -21,7 +23,7 @@ mod terminal;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-    init_tracing();
+    init_tracing()?;
 
     let config = config::Config::from_env()?;
     let framework = framework::create_framework(config.clone());
@@ -38,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let app_level = butler_log_level();
+fn init_tracing() -> anyhow::Result<()> {
+    let app_level = butler_log_level()?;
     let filter = filter_fn(move |metadata| {
         let target = metadata.target();
         let max_level = if target.starts_with("butler_rs") || target.starts_with("status_debug") {
@@ -62,21 +64,25 @@ fn init_tracing() {
                 .with_filter(filter),
         )
         .init();
+    Ok(())
 }
 
-fn butler_log_level() -> LevelFilter {
-    match std::env::var("BUTLER_LOG")
-        .unwrap_or_else(|_| "info".to_string())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "off" => LevelFilter::OFF,
-        "error" => LevelFilter::ERROR,
-        "warn" | "warning" => LevelFilter::WARN,
-        "debug" => LevelFilter::DEBUG,
-        "trace" => LevelFilter::TRACE,
-        _ => LevelFilter::INFO,
+fn butler_log_level() -> anyhow::Result<LevelFilter> {
+    parse_butler_log_level(std::env::var("BUTLER_LOG").ok().as_deref())
+}
+
+fn parse_butler_log_level(value: Option<&str>) -> anyhow::Result<LevelFilter> {
+    let value = value.unwrap_or("info").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "off" => Ok(LevelFilter::OFF),
+        "error" => Ok(LevelFilter::ERROR),
+        "warn" | "warning" => Ok(LevelFilter::WARN),
+        "info" => Ok(LevelFilter::INFO),
+        "debug" => Ok(LevelFilter::DEBUG),
+        "trace" => Ok(LevelFilter::TRACE),
+        other => anyhow::bail!(
+            "BUTLER_LOG must be one of off, error, warn, info, debug, trace; got `{other}`"
+        ),
     }
 }
 
@@ -91,5 +97,20 @@ fn metadata_enabled(metadata: &Metadata<'_>, max_level: LevelFilter) -> bool {
             Level::ERROR | Level::WARN | Level::INFO | Level::DEBUG
         ),
         LevelFilter::TRACE => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_butler_log_levels_strictly() {
+        assert_eq!(parse_butler_log_level(None).unwrap(), LevelFilter::INFO);
+        assert_eq!(
+            parse_butler_log_level(Some("warning")).unwrap(),
+            LevelFilter::WARN
+        );
+        assert!(parse_butler_log_level(Some("verbose")).is_err());
     }
 }

@@ -1,8 +1,12 @@
 [package]
 name = "butler_rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 default-run = "butler_rs"
+description = "Discord operations bot for Minecraft server workflows and diagnostics."
+repository = "https://github.com/germagla/butler_rs"
+license = "MIT"
+keywords = ["discord", "minecraft", "operations", "bot", "aternos"]
 
 [dependencies]
 headless_chrome = "1.0"

@@ -1,0 +1,14 @@
+.git
+target
+artifacts
+.env
+.env.*
+!.env.example
+.DS_Store
+*.dump.html
+*dump.html
+*screenshot.png
+dashboard_after_start.html
+dashboard_after_start.png
+failure.html
+failure.png

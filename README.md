@@ -4,7 +4,7 @@
 
 A Rust-powered Discord operations bot for community infrastructure, game-server workflows, diagnostics, and future AI utilities.
 
-The repository is currently named `butler_rs`, but the product identity is Butler. It is a Rust rewrite of an older Python Discord bot, built to improve reliability, type safety, async backend structure, and long-term maintainability. The first real integration is Minecraft server operations through an Aternos browser adapter, but the architecture is intended to grow as a provider-backed operations bot rather than an Aternos-only automation script.
+The repository is named `butler_rs`, but the product identity is Butler. The current server integration is a browser-backed Aternos provider for Minecraft operations. The service layer uses provider-neutral start result and failure types so future providers can be added without changing command handling.
 
 ## Current Features
 
@@ -16,7 +16,22 @@ The repository is currently named `butler_rs`, but the product identity is Butle
 - `/bot last-error` shows the most recent failed run.
 - Temporary legacy aliases: `/aternos_start` and `/aternos_status`.
 - Terminal diagnostics for local operation.
-- Ignored local artifacts for screenshots, HTML captures, and JSONL event diagnostics.
+- Local screenshots, HTML captures, and JSONL event diagnostics with redaction and retention controls.
+
+## Command Access
+
+| Command | Access |
+| --- | --- |
+| `/server start` | Public |
+| `/server status` | Public |
+| `/aternos_start` | Public deprecated alias |
+| `/aternos_status` | Public deprecated alias |
+| `/server diagnose` | Bot owner or guild Administrator |
+| `/bot runs` | Bot owner or guild Administrator |
+| `/bot run` | Bot owner or guild Administrator |
+| `/bot last-error` | Bot owner or guild Administrator |
+
+Bot owners are configured with `BUTLER_OWNER_IDS`. In DMs, restricted commands are owner-only because there is no guild Administrator context. Owners can inspect all run history; guild Administrators can inspect raw run history only for runs from their current guild.
 
 ## Architecture
 
@@ -25,42 +40,43 @@ flowchart LR
     Discord["Discord"]
     Poise["Poise commands"]
     Service["Server service"]
+    Start["Start orchestration"]
+    Status["Status and diagnose"]
+    Queries["Run history queries"]
     Minecraft["Minecraft status"]
-    Provider["Aternos provider adapter"]
+    Provider["ServerStartProvider"]
+    Aternos["Browser Aternos provider"]
     History["Run history"]
     Artifacts["Local artifacts"]
 
     Discord --> Poise
     Poise --> Service
-    Service --> Minecraft
-    Service --> Provider
-    Service --> History
-    Provider --> Artifacts
+    Service --> Start
+    Service --> Status
+    Service --> Queries
+    Start --> Minecraft
+    Start --> Provider
+    Provider --> Aternos
+    Aternos --> Artifacts
+    Start --> History
+    Queries --> History
     History --> Artifacts
 ```
 
-The active start lock is currently process-local and global, which is appropriate for the single configured server this version targets. Future multi-server support should key active runs by workspace, guild, or server ID.
+The active start lock is process-local and global, which is appropriate for the single configured server this version targets. Future multi-server support should key active runs by workspace, guild, or server ID.
 
-`src/server_service.rs` still carries start orchestration, status, run queries, run tracking, and formatting. A later cleanup can split it into smaller service modules after the current behavior is covered by tests.
-
-## Tech Stack
-
-- Rust 2024
-- Tokio
-- Serenity and Poise
-- `headless_chrome`
-- `craftping`
-- `tracing`
+`src/server_service/` is split into start orchestration, status/diagnose, run queries, run tracking/artifact retention, response formatting, and shared types.
 
 ## Local Setup
 
 1. Install Rust.
-2. Copy `.env.example` to `.env`.
-3. Fill in Discord, provider, and Minecraft settings.
-4. Run the bot:
+2. Install Chrome or Chromium for `/server start`; set `CHROME=/path/to/chrome-or-chromium` in `.env` if it is not auto-detected.
+3. Copy `.env.example` to `.env`.
+4. Fill in Discord, provider, Minecraft, and owner settings.
+5. Run the bot:
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 For a live Minecraft status probe without Discord:
@@ -80,20 +96,60 @@ cargo run --bin status_debug -- your-server.example.com:25565
 | `SERVER_ID` | Optional provider-specific server selector. | Empty |
 | `HEADLESS` | Run browser automation headlessly. | `true` |
 | `START_WAIT_ONLINE_SECS` | Max wait when `/server start wait_online:true` is used. | `600` |
-| `RUN_HISTORY_LIMIT` | Number of completed runs retained in memory. | `20` |
+| `RUN_HISTORY_LIMIT` | Completed runs retained in memory and newest artifact run directories retained locally. | `20` |
 | `ARTIFACT_DIR` | Local diagnostics directory. | `artifacts/runs` |
+| `ARTIFACT_CAPTURE` | Artifact capture policy: `screenshots`, `full`, `failure`, or `off`. | `screenshots` |
+| `BUTLER_ATTACH_SCREENSHOTS` | Attach saved screenshots in Discord responses when available. Missing files fall back to text. | `true` |
+| `BUTLER_OWNER_IDS` | Comma-separated Discord user IDs authorized for restricted commands. Invalid non-numeric IDs fail startup. | Empty |
 | `BUTLER_PERSIST_RUN_EVENTS` | Write step-level JSONL diagnostics under `ARTIFACT_DIR`. | `true` |
 | `BUTLER_REDACT_RUN_EVENTS` | Redact Discord IDs and names in persisted JSONL events. | `true` |
 | `BUTLER_LOG` | Tracing/debug verbosity: `off`, `error`, `warn`, `info`, `debug`, `trace`. | `info` |
 | `BUTLER_COLOR` | Enable colored terminal output unless `NO_COLOR` or `TERM=dumb` disables it. | `true` |
 
+Invalid boolean, numeric, owner ID, artifact capture, log level, and color values fail startup instead of falling back silently.
+
+## Artifact Policy
+
+Artifacts are local diagnostics only and are ignored by git. Screenshots are treated as operational diagnostics so the current browser/dashboard state is easy to inspect locally and, when available, in Discord responses.
+
+`ARTIFACT_CAPTURE` controls local browser artifacts:
+
+| Value | Success capture | Failure capture |
+| --- | --- | --- |
+| `screenshots` | Screenshot | Screenshot and HTML |
+| `full` | Screenshot and HTML | Screenshot and HTML |
+| `failure` | None | Screenshot and HTML |
+| `off` | None | None |
+
+`events.jsonl` persists step-level run events by default. With `BUTLER_REDACT_RUN_EVENTS=true`, Discord user IDs, user names, guild/channel IDs, and guild/channel names are redacted. On startup, if redaction is enabled and an existing `events.jsonl` appears unredacted, Butler rotates it to `events.unredacted.backup.jsonl`; unreadable or corrupt event logs are quarantined to `events.corrupt.backup.jsonl` before new events are written.
+
+Artifact writes are diagnostic-only: if a screenshot, HTML, or marker file cannot be written, the command continues and logs a warning. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
+
+## Docker
+
+Build the baseline image:
+
+```bash
+docker build -t butler_rs .
+```
+
+Run with a named artifact volume:
+
+```bash
+docker volume create butler_rs_artifacts
+docker run --rm --env-file .env -e ARTIFACT_DIR=/data/artifacts/runs -v butler_rs_artifacts:/data/artifacts/runs butler_rs
+```
+
+The Docker runtime uses Debian with Chromium installed, sets `HEADLESS=true`, sets `CHROME=/usr/bin/chromium`, and documents `/data/artifacts/runs` as the container artifact directory. The explicit `-e ARTIFACT_DIR=/data/artifacts/runs` matters if your local `.env` was copied from `.env.example`, because that file uses `artifacts/runs` for non-container development. If you bind-mount a host directory on Linux, make it writable by UID `10001`, for example `mkdir -p artifacts/runs && sudo chown -R 10001:10001 artifacts/runs`.
+
 ## Safety And Privacy
 
 - Never commit `.env`.
-- Runtime artifacts may contain Discord IDs, usernames, guild/channel names, local paths, screenshots, and authenticated page HTML.
-- Artifacts are local diagnostics only and are ignored by git.
+- Runtime artifacts may contain Discord metadata, local paths, screenshots, and authenticated page HTML.
+- Screenshots are kept available by default for operational diagnosis. Because `/server start` is public by design, enabled screenshot attachment may post authenticated dashboard screenshots to the Discord channel where the command is used.
+- HTML is more sensitive, so the default only captures HTML on failure.
 - Persisted JSONL events redact Discord names and IDs by default. Set `BUTLER_PERSIST_RUN_EVENTS=false` to disable persisted event logs.
-- If runtime artifacts or secrets were ever pushed, clean future commits and rotate affected secrets. Do not rewrite shared history automatically without coordinating it.
+- If runtime artifacts or secrets were ever pushed, clean future commits, prune history deliberately, and rotate affected secrets.
 
 ## Quality Gates
 
@@ -104,19 +160,11 @@ cargo fmt --all -- --check
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings
+docker build -t butler_rs:ci .
 ```
 
 Local development should run the same gates before opening a pull request.
 
-## Roadmap
+## License
 
-- Provider abstraction beyond the current browser-backed Aternos adapter.
-- Better persistence and retention for run history.
-- Permission model for diagnostics and run artifact access.
-- Docker deployment.
-- AI utilities once the Rust backend foundation is stable.
-- TypeScript dashboard for operations visibility.
-
-## History Cleanup Note
-
-This change removes runtime artifacts from the working tree and prevents future commits from tracking them. If sensitive artifacts were already pushed, use a coordinated history cleanup tool such as `git filter-repo` or BFG, then force-push only after confirming that collaborators and deployments are ready. Rotate any affected tokens or passwords.
+MIT. See `LICENSE`.

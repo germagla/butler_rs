@@ -89,7 +89,7 @@ pub fn create_framework(config: Config) -> poise::Framework<BotState, anyhow::Er
                     "complete",
                 ));
 
-                Ok(BotState::new(config))
+                BotState::new(config)
             })
         })
         .build()
