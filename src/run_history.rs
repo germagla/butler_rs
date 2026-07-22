@@ -17,6 +17,7 @@ const LEGACY_RUN_ARTIFACT_FILES: &[&str] = &[
     "failure.png",
     "failure.html",
 ];
+const ARTIFACT_WRITE_PROBE_PREFIX: &str = ".butler-write-probe";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunContext {
@@ -217,8 +218,60 @@ pub fn now_ms() -> u128 {
 }
 
 pub fn mark_run_artifact_dir(run_dir: &Path) -> Result<()> {
-    fs::write(run_dir.join(RUN_DIR_MARKER), "butler-run\n")?;
+    fs::write(run_dir.join(RUN_DIR_MARKER), "butler-run\n").with_context(|| {
+        format!(
+            "ArtifactWrite: could not write marker in {}",
+            run_dir.display()
+        )
+    })?;
     Ok(())
+}
+
+pub fn verify_artifact_dir_writable(artifact_dir: &Path) -> Result<()> {
+    fs::create_dir_all(artifact_dir).with_context(|| {
+        format!(
+            "ArtifactWrite: could not create artifact dir {}",
+            artifact_dir.display()
+        )
+    })?;
+    for attempt in 0..16 {
+        let probe = artifact_dir.join(format!(
+            "{ARTIFACT_WRITE_PROBE_PREFIX}-{}-{}-{attempt}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&probe) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "ArtifactWrite: could not create artifact probe in {}",
+                        artifact_dir.display()
+                    )
+                });
+            }
+        };
+        file.write_all(b"butler artifact write probe\n")
+            .with_context(|| {
+                format!(
+                    "ArtifactWrite: could not write artifact probe in {}",
+                    artifact_dir.display()
+                )
+            })?;
+        drop(file);
+        fs::remove_file(&probe).with_context(|| {
+            format!(
+                "ArtifactWrite: could not remove artifact probe {}",
+                probe.display()
+            )
+        })?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "ArtifactWrite: could not create unique artifact probe in {}",
+        artifact_dir.display()
+    );
 }
 
 pub fn maintain_event_file_if_needed(artifact_dir: &Path) -> Result<Option<EventFileMaintenance>> {
@@ -448,6 +501,22 @@ mod tests {
         fs::create_dir(&path).unwrap();
         mark_run_artifact_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn artifact_writable_probe_creates_missing_dir_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "butler_rs_probe_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+
+        verify_artifact_dir_writable(&dir).unwrap();
+
+        assert!(dir.is_dir());
+        let leftovers = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 0);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

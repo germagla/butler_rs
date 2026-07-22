@@ -85,6 +85,36 @@ For a live Minecraft status probe without Discord:
 cargo run --bin status_debug -- your-server.example.com:25565
 ```
 
+### Start Automatically On macOS
+
+Install Butler as a per-user LaunchAgent so it starts after login and restarts if it exits:
+
+```bash
+./scripts/install-launch-agent.sh
+```
+
+The installer builds the release binary, restricts `.env` to owner-only access, and runs the binary with the repository as its working directory. Re-run the installer after code changes to rebuild and restart the service.
+
+Do not also run `cargo run --release` while the LaunchAgent is loaded, because that starts a second bot process. For an interactive run, unload the service first, then re-run the installer when finished:
+
+```bash
+launchctl bootout gui/$(id -u)/com.germagla.butler-rs
+cargo run --release
+```
+
+Inspect the service and logs:
+
+```bash
+launchctl print gui/$(id -u)/com.germagla.butler-rs
+tail -f artifacts/launchd/stdout.log artifacts/launchd/stderr.log
+```
+
+Remove automatic startup without deleting logs or run artifacts:
+
+```bash
+./scripts/uninstall-launch-agent.sh
+```
+
 ## Configuration
 
 | Variable | Purpose | Default |
@@ -123,7 +153,7 @@ Artifacts are local diagnostics only and are ignored by git. Screenshots are tre
 
 `events.jsonl` persists step-level run events by default. With `BUTLER_REDACT_RUN_EVENTS=true`, Discord user IDs, user names, guild/channel IDs, and guild/channel names are redacted. On startup, if redaction is enabled and an existing `events.jsonl` appears unredacted, Butler rotates it to `events.unredacted.backup.jsonl`; unreadable or corrupt event logs are quarantined to `events.corrupt.backup.jsonl` before new events are written.
 
-Artifact writes are diagnostic-only: if a screenshot, HTML, or marker file cannot be written, the command continues and logs a warning. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
+When artifact capture or run-event persistence is enabled, Butler verifies on startup that `ARTIFACT_DIR` can be created, written, and cleaned up. Artifact writes during a run are diagnostic-only: if a screenshot, HTML, or marker file cannot be written, the command continues and logs a warning. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
 
 ## Docker
 

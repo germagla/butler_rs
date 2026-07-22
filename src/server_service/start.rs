@@ -19,6 +19,10 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio::time::sleep;
 
+const POST_CLICK_VERIFY_SECS: u64 = 60;
+const MINECRAFT_STATUS_POLL_SECS: u64 = 5;
+const UNCONFIRMED_ATERNOS_STATUS: &str = "Unconfirmed (browser confirmation lost)";
+
 pub async fn start_server(ctx: Context<'_>, options: StartOptions) -> Result<()> {
     start_server_with_notice(ctx, options, None).await
 }
@@ -295,6 +299,7 @@ async fn start_server_inner(
                 tracker,
                 failure,
                 preflight_status,
+                options,
                 progress_message,
                 notice,
             )
@@ -350,67 +355,12 @@ async fn handle_provider_success(
             screenshot_path.clone(),
         )
         .await?;
-        let wait_started_at_ms = now_ms();
-        let deadline = wait_started_at_ms
-            .saturating_add((ctx.data().config.start_wait_online_secs as u128) * 1000);
-        loop {
-            match minecraft::get_configured_status(&ctx.data().config).await {
-                Ok(status @ ServerStatus::Online { .. }) => {
-                    final_minecraft_status = Some(status.to_string());
-                    outcome = "MinecraftOnline".to_string();
-                    final_error_class = None;
-                    tracker
-                        .step(
-                            "minecraft_wait_online",
-                            "online",
-                            Some(status.to_string()),
-                            None,
-                            None,
-                        )
-                        .await;
-                    break;
-                }
-                Ok(status) => {
-                    final_minecraft_status = Some(status.to_string());
-                    tracker
-                        .step(
-                            "minecraft_wait_online",
-                            "waiting",
-                            Some(status.to_string()),
-                            None,
-                            None,
-                        )
-                        .await;
-                }
-                Err(error) => {
-                    tracker
-                        .step(
-                            "minecraft_wait_online",
-                            "warning",
-                            Some(error.to_string()),
-                            None,
-                            Some("MinecraftStatusError".to_string()),
-                        )
-                        .await;
-                }
-            }
-
-            if now_ms() >= deadline {
-                outcome = "WaitOnlineTimeout".to_string();
-                final_error_class = Some("WaitOnlineTimeout".to_string());
-                tracker
-                    .step(
-                        "minecraft_wait_online",
-                        "timeout",
-                        Some("Timed out waiting for Minecraft to report online".to_string()),
-                        None,
-                        Some("WaitOnlineTimeout".to_string()),
-                    )
-                    .await;
-                break;
-            }
-            sleep(Duration::from_secs(5)).await;
-        }
+        let wait_result = wait_for_minecraft_online(ctx, tracker).await;
+        final_minecraft_status = wait_result
+            .final_minecraft_status
+            .or(final_minecraft_status);
+        outcome = wait_result.outcome;
+        final_error_class = wait_result.error_class;
     }
 
     let content = start_final_content(
@@ -439,14 +389,175 @@ async fn handle_provider_success(
     Ok(())
 }
 
+struct MinecraftWaitResult {
+    outcome: String,
+    final_minecraft_status: Option<String>,
+    error_class: Option<String>,
+}
+
+async fn wait_for_minecraft_online(
+    ctx: Context<'_>,
+    tracker: &mut RunTracker<'_>,
+) -> MinecraftWaitResult {
+    let mut final_minecraft_status = None;
+    let mut outcome = "WaitOnlineTimeout".to_string();
+    let mut error_class = Some("WaitOnlineTimeout".to_string());
+    let wait_started_at_ms = now_ms();
+    let deadline = wait_started_at_ms
+        .saturating_add((ctx.data().config.start_wait_online_secs as u128) * 1000);
+
+    loop {
+        match minecraft::get_configured_status(&ctx.data().config).await {
+            Ok(status @ ServerStatus::Online { .. }) => {
+                final_minecraft_status = Some(status.to_string());
+                outcome = "MinecraftOnline".to_string();
+                error_class = None;
+                tracker
+                    .step(
+                        "minecraft_wait_online",
+                        "online",
+                        Some(status.to_string()),
+                        None,
+                        None,
+                    )
+                    .await;
+                break;
+            }
+            Ok(status) => {
+                final_minecraft_status = Some(status.to_string());
+                tracker
+                    .step(
+                        "minecraft_wait_online",
+                        "waiting",
+                        Some(status.to_string()),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            Err(error) => {
+                tracker
+                    .step(
+                        "minecraft_wait_online",
+                        "warning",
+                        Some(error.to_string()),
+                        None,
+                        Some("MinecraftStatusError".to_string()),
+                    )
+                    .await;
+            }
+        }
+
+        if now_ms() >= deadline {
+            tracker
+                .step(
+                    "minecraft_wait_online",
+                    "timeout",
+                    Some("Timed out waiting for Minecraft to report online".to_string()),
+                    None,
+                    Some("WaitOnlineTimeout".to_string()),
+                )
+                .await;
+            break;
+        }
+        sleep(Duration::from_secs(MINECRAFT_STATUS_POLL_SECS)).await;
+    }
+
+    MinecraftWaitResult {
+        outcome,
+        final_minecraft_status,
+        error_class,
+    }
+}
+
+struct SubmissionVerificationResult {
+    confirmed_status: Option<ServerStatus>,
+    final_minecraft_status: Option<String>,
+}
+
+async fn verify_submitted_start(
+    ctx: Context<'_>,
+    tracker: &mut RunTracker<'_>,
+) -> SubmissionVerificationResult {
+    let mut final_minecraft_status = None;
+    let deadline = now_ms().saturating_add((POST_CLICK_VERIFY_SECS as u128) * 1000);
+
+    loop {
+        match minecraft::get_configured_status(&ctx.data().config).await {
+            Ok(status) => {
+                let status_text = status.to_string();
+                let confirmed = status_confirms_start_submission(&status);
+                final_minecraft_status = Some(status_text.clone());
+                tracker
+                    .step(
+                        "minecraft_post_click_verify",
+                        if confirmed { "accepted" } else { "waiting" },
+                        Some(status_text),
+                        None,
+                        None,
+                    )
+                    .await;
+                if confirmed {
+                    return SubmissionVerificationResult {
+                        confirmed_status: Some(status),
+                        final_minecraft_status,
+                    };
+                }
+            }
+            Err(error) => {
+                tracker
+                    .step(
+                        "minecraft_post_click_verify",
+                        "warning",
+                        Some(error.to_string()),
+                        None,
+                        Some("MinecraftStatusError".to_string()),
+                    )
+                    .await;
+            }
+        }
+
+        if now_ms() >= deadline {
+            tracker
+                .step(
+                    "minecraft_post_click_verify",
+                    "timeout",
+                    Some("Timed out verifying whether the start was submitted".to_string()),
+                    None,
+                    Some("StartSubmissionUnverified".to_string()),
+                )
+                .await;
+            return SubmissionVerificationResult {
+                confirmed_status: None,
+                final_minecraft_status,
+            };
+        }
+        sleep(Duration::from_secs(MINECRAFT_STATUS_POLL_SECS)).await;
+    }
+}
+
 async fn handle_provider_failure(
     ctx: Context<'_>,
     tracker: &mut RunTracker<'_>,
     failure: ProviderStartFailure,
     preflight_status: Option<String>,
+    options: StartOptions,
     progress_message: &poise::ReplyHandle<'_>,
     notice: Option<&str>,
 ) -> Result<()> {
+    if failure.start_may_have_been_submitted {
+        return handle_unconfirmed_submitted_start(
+            ctx,
+            tracker,
+            failure,
+            preflight_status,
+            options,
+            progress_message,
+            notice,
+        )
+        .await;
+    }
+
     let screenshot_path = failure.screenshot_path.clone();
     tracker
         .step(
@@ -479,10 +590,138 @@ async fn handle_provider_failure(
     Ok(())
 }
 
-fn provider_failure_public_content(error_class: &str, run_id: &str) -> String {
-    format!(
-        "Start failed: **{error_class}**\nRun: `{run_id}`\nAn owner or server Administrator can inspect raw details with `/bot run run_id:{run_id}`."
+async fn handle_unconfirmed_submitted_start(
+    ctx: Context<'_>,
+    tracker: &mut RunTracker<'_>,
+    failure: ProviderStartFailure,
+    preflight_status: Option<String>,
+    options: StartOptions,
+    progress_message: &poise::ReplyHandle<'_>,
+    notice: Option<&str>,
+) -> Result<()> {
+    let screenshot_path = failure.screenshot_path.clone();
+    tracker
+        .step(
+            "aternos_dashboard",
+            "StartSubmittedUnconfirmed",
+            Some(format_failure_detail(&failure)),
+            screenshot_path.clone(),
+            Some(failure.error_class.clone()),
+        )
+        .await;
+
+    edit_start_message(
+        ctx,
+        progress_message,
+        notice,
+        start_submission_checking_content(&tracker.context.run_id),
+        screenshot_path.clone(),
     )
+    .await?;
+
+    let verification = verify_submitted_start(ctx, tracker).await;
+    if let Some(status) = verification.confirmed_status {
+        let mut final_minecraft_status = Some(status.to_string());
+        let mut outcome = "StartSubmittedUnconfirmed".to_string();
+        let mut final_error_class = None;
+
+        if options.wait_online {
+            edit_start_message(
+                ctx,
+                progress_message,
+                notice,
+                format!(
+                    "Start appears submitted. Waiting up to {} for Minecraft to report online.\nRun: `{}`",
+                    terminal::format_duration(
+                        (ctx.data().config.start_wait_online_secs as u128) * 1000
+                    ),
+                    tracker.context.run_id
+                ),
+                screenshot_path.clone(),
+            )
+            .await?;
+            let wait_result = wait_for_minecraft_online(ctx, tracker).await;
+            final_minecraft_status = wait_result
+                .final_minecraft_status
+                .or(final_minecraft_status);
+            outcome = wait_result.outcome;
+            final_error_class = wait_result.error_class;
+            edit_start_message(
+                ctx,
+                progress_message,
+                notice,
+                start_submitted_unconfirmed_wait_final_content(&tracker.context.run_id, &outcome),
+                screenshot_path.clone(),
+            )
+            .await?;
+        } else {
+            edit_start_message(
+                ctx,
+                progress_message,
+                notice,
+                start_submitted_unconfirmed_content(&tracker.context.run_id, &status),
+                screenshot_path.clone(),
+            )
+            .await?;
+        }
+
+        tracker
+            .finish(
+                &outcome,
+                Some(UNCONFIRMED_ATERNOS_STATUS.to_string()),
+                final_minecraft_status,
+                screenshot_path,
+                final_error_class,
+            )
+            .await;
+        return Ok(());
+    }
+
+    let final_minecraft_status = verification.final_minecraft_status.or(preflight_status);
+    edit_start_message(
+        ctx,
+        progress_message,
+        notice,
+        start_submission_unverified_content(&tracker.context.run_id),
+        screenshot_path.clone(),
+    )
+    .await?;
+    tracker
+        .finish(
+            "StartSubmissionUnverified",
+            Some(UNCONFIRMED_ATERNOS_STATUS.to_string()),
+            final_minecraft_status,
+            screenshot_path,
+            Some("StartSubmissionUnverified".to_string()),
+        )
+        .await;
+    Ok(())
+}
+
+fn provider_failure_public_content(error_class: &str, run_id: &str) -> String {
+    format!("Start failed: **{error_class}**\nRun: `{run_id}`")
+}
+
+fn status_confirms_start_submission(status: &ServerStatus) -> bool {
+    !status.is_offline_like()
+}
+
+fn start_submission_checking_content(run_id: &str) -> String {
+    format!("Start may have been submitted. Checking Minecraft status...\nRun: `{run_id}`")
+}
+
+fn start_submitted_unconfirmed_content(run_id: &str, status: &ServerStatus) -> String {
+    format!(
+        "Start appears submitted, but browser confirmation was lost.\nMinecraft: **{status}**\nRun: `{run_id}`"
+    )
+}
+
+fn start_submitted_unconfirmed_wait_final_content(run_id: &str, outcome: &str) -> String {
+    start_final_content(run_id, UNCONFIRMED_ATERNOS_STATUS, outcome)
+}
+
+fn start_submission_unverified_content(run_id: &str) -> String {
+    format!("Start could not be verified after browser confirmation was lost.\nRun: `{run_id}`")
 }
 
 #[cfg(test)]
@@ -524,5 +763,52 @@ mod tests {
         assert!(content.contains("abc123"));
         assert!(!content.contains("selector"));
         assert!(!content.contains("/tmp"));
+        assert!(!content.contains("An owner or server Administrator"));
+        assert!(!content.contains("/bot run"));
+        assert_eq!(content, "Start failed: **StartNotAccepted**\nRun: `abc123`");
+    }
+
+    #[test]
+    fn start_submission_status_detection_accepts_transitional_and_online() {
+        assert!(status_confirms_start_submission(&ServerStatus::Queued));
+        assert!(status_confirms_start_submission(&ServerStatus::Starting));
+        assert!(status_confirms_start_submission(&ServerStatus::Preparing));
+        assert!(status_confirms_start_submission(&ServerStatus::Loading));
+        assert!(status_confirms_start_submission(&ServerStatus::Online {
+            online: 0,
+            max: 20,
+            players: Vec::new(),
+        }));
+        assert!(!status_confirms_start_submission(&ServerStatus::Offline));
+        assert!(!status_confirms_start_submission(
+            &ServerStatus::Unreachable {
+                reason: "timeout".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_start_public_content_is_short_and_scoped() {
+        let checking = start_submission_checking_content("abc123");
+        assert_eq!(
+            checking,
+            "Start may have been submitted. Checking Minecraft status...\nRun: `abc123`"
+        );
+
+        let accepted = start_submitted_unconfirmed_content("abc123", &ServerStatus::Starting);
+        assert!(accepted.contains("Start appears submitted"));
+        assert!(accepted.contains("Minecraft: **Starting**"));
+        assert!(accepted.contains("Run: `abc123`"));
+
+        let wait_done = start_submitted_unconfirmed_wait_final_content("abc123", "MinecraftOnline");
+        assert!(wait_done.contains("Server is online."));
+        assert!(wait_done.contains("Aternos: **Unconfirmed"));
+        assert!(wait_done.contains("Run: `abc123`"));
+
+        let unverified = start_submission_unverified_content("abc123");
+        assert_eq!(
+            unverified,
+            "Start could not be verified after browser confirmation was lost.\nRun: `abc123`"
+        );
     }
 }

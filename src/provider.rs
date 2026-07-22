@@ -30,6 +30,7 @@ pub struct ProviderStartFailure {
     pub message: String,
     pub screenshot_path: Option<PathBuf>,
     pub html_path: Option<PathBuf>,
+    pub start_may_have_been_submitted: bool,
 }
 
 impl std::fmt::Display for ProviderStartFailure {
@@ -109,6 +110,7 @@ mod tests {
                 message: "still offline".to_string(),
                 screenshot_path: None,
                 html_path: None,
+                start_may_have_been_submitted: false,
             }),
         };
 

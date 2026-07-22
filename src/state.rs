@@ -1,6 +1,6 @@
 use crate::{
-    config::Config,
-    run_history::{EventFileMaintenance, RunContext, RunStore},
+    config::{ArtifactCapture, Config},
+    run_history::{EventFileMaintenance, RunContext, RunStore, verify_artifact_dir_writable},
     terminal,
 };
 use anyhow::{Context, Result};
@@ -46,6 +46,15 @@ impl BotState {
                     )
                 });
             }
+        }
+
+        if config.artifact_capture != ArtifactCapture::Off || config.persist_run_events {
+            verify_artifact_dir_writable(&config.artifact_dir).with_context(|| {
+                format!(
+                    "artifact directory is not writable: {}",
+                    config.artifact_dir.display()
+                )
+            })?;
         }
 
         let run_store = RunStore::new(
