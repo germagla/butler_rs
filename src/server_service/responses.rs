@@ -9,15 +9,20 @@ pub(super) fn start_progress_content(run_id: &str, notice: Option<&str>) -> Stri
     with_notice(format!("Starting server...\nRun: `{run_id}`"), notice)
 }
 
-pub(super) fn start_final_content(run_id: &str, dashboard_status: &str, outcome: &str) -> String {
+pub(super) fn start_final_content(
+    run_id: &str,
+    provider_name: &str,
+    provider_status: &str,
+    outcome: &str,
+) -> String {
     let headline = match outcome {
         "MinecraftOnline" => "Server is online.",
         "WaitOnlineTimeout" => {
-            "Aternos accepted the start, but Minecraft did not report online before timeout."
+            "The provider accepted the start, but Minecraft did not report online before timeout."
         }
         _ => "Start accepted.",
     };
-    format!("{headline}\nAternos: **{dashboard_status}**\nRun: `{run_id}`")
+    format!("{headline}\nProvider ({provider_name}): **{provider_status}**\nRun: `{run_id}`")
 }
 
 pub(super) fn with_notice(content: String, notice: Option<&str>) -> String {
@@ -140,8 +145,9 @@ pub(super) fn format_run_detail(run: &RunSummary) -> String {
         format!("Duration: `{}ms`", run.duration_ms),
     ];
 
-    if let Some(status) = &run.final_aternos_status {
-        lines.push(format!("Aternos dashboard: **{status}**"));
+    lines.push(format!("Provider: `{}`", run.context.provider));
+    if let Some(status) = &run.final_provider_status {
+        lines.push(format!("Provider status: **{status}**"));
     }
     if let Some(status) = &run.final_minecraft_status {
         lines.push(format!("Minecraft status: **{status}**"));
@@ -170,16 +176,16 @@ pub(super) fn format_run_detail(run: &RunSummary) -> String {
     lines.join("\n")
 }
 
-pub(super) fn format_dashboard_detail(status: &str, html_path: Option<&PathBuf>) -> String {
-    match html_path {
-        Some(path) => format!("Dashboard status: {status}; html={}", path.display()),
-        None => format!("Dashboard status: {status}"),
+pub(super) fn format_provider_detail(status: &str, artifact_path: Option<&PathBuf>) -> String {
+    match artifact_path {
+        Some(path) => format!("Provider status: {status}; artifact={}", path.display()),
+        None => format!("Provider status: {status}"),
     }
 }
 
 pub(super) fn format_failure_detail(failure: &ProviderStartFailure) -> String {
-    match &failure.html_path {
-        Some(path) => format!("{}; html={}", failure.message, path.display()),
+    match &failure.detail_artifact_path {
+        Some(path) => format!("{}; artifact={}", failure.message, path.display()),
         None => failure.message.clone(),
     }
 }

@@ -1,16 +1,17 @@
 use crate::{
-    config::{ArtifactCapture, Config},
+    config::{ArtifactCapture, AternosConfig},
     provider::{
         ProviderStartFailure, ProviderStartFuture, ProviderStartResult, ServerStartProvider,
         StartOutcome,
     },
-    run_history::mark_run_artifact_dir,
+    run_history::{ensure_owner_only_file, mark_run_artifact_dir},
     terminal,
 };
 use anyhow::{Context, Result, anyhow};
 use headless_chrome::{Browser, Element, LaunchOptions, browser::tab::point::Point};
 use rand::Rng;
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
     thread::sleep,
@@ -53,17 +54,40 @@ const RANDOM_DELAY_MAX_MS: u64 = 1500;
 /// The rest of the bot treats this as a server start provider. A future HTTP or
 /// first-party provider should preserve this result/error contract instead of
 /// leaking provider-specific details into command handling.
-pub struct BrowserAternosProvider;
+pub struct BrowserAternosProvider {
+    config: AternosConfig,
+    artifact_dir: PathBuf,
+    artifact_capture: ArtifactCapture,
+}
+
+impl BrowserAternosProvider {
+    pub fn new(
+        config: AternosConfig,
+        artifact_dir: PathBuf,
+        artifact_capture: ArtifactCapture,
+    ) -> Self {
+        Self {
+            config,
+            artifact_dir,
+            artifact_capture,
+        }
+    }
+}
 
 impl ServerStartProvider for BrowserAternosProvider {
-    fn start<'a>(&'a self, config: &'a Config, run_id: &'a str) -> ProviderStartFuture<'a> {
+    fn name(&self) -> &'static str {
+        "aternos"
+    }
+
+    fn start<'a>(&'a self, run_id: &'a str) -> ProviderStartFuture<'a> {
         Box::pin(async move {
-            let username = config.aternos_user.clone();
-            let password = config.aternos_pass.clone();
-            let server_id = config.server_id.clone();
-            let headless = config.headless;
-            let run_dir = config.artifact_dir.join(run_id);
-            let artifact_capture = config.artifact_capture;
+            let username = self.config.user.clone();
+            let password = self.config.password.clone();
+            let server_id = self.config.server_id.clone();
+            let headless = self.config.headless;
+            let chrome_path = self.config.chrome_path.clone();
+            let run_dir = self.artifact_dir.join(run_id);
+            let artifact_capture = self.artifact_capture;
 
             tokio::task::spawn_blocking(move || {
                 run_browser_start(
@@ -71,6 +95,7 @@ impl ServerStartProvider for BrowserAternosProvider {
                     password,
                     server_id,
                     headless,
+                    chrome_path,
                     run_dir,
                     artifact_capture,
                 )
@@ -80,7 +105,8 @@ impl ServerStartProvider for BrowserAternosProvider {
                 error_class: "BrowserThreadJoin".to_string(),
                 message: error.to_string(),
                 screenshot_path: None,
-                html_path: None,
+                detail_artifact_path: None,
+                minecraft_address: None,
                 start_may_have_been_submitted: false,
             })?
         })
@@ -92,33 +118,40 @@ fn run_browser_start(
     password: String,
     server_id: Option<String>,
     headless: bool,
+    chrome_path: Option<PathBuf>,
     run_dir: PathBuf,
     artifact_capture: ArtifactCapture,
 ) -> Result<ProviderStartResult, ProviderStartFailure> {
+    let context = BrowserStartContext {
+        username: &username,
+        password: &password,
+        server_id: server_id.as_deref(),
+        headless,
+        chrome_path: chrome_path.as_deref(),
+        run_dir: &run_dir,
+        artifact_capture,
+    };
     run_with_browser_disconnect_retry(
         |capture_retryable_failure_artifacts| {
-            run_browser_start_once(
-                &username,
-                &password,
-                server_id.as_deref(),
-                headless,
-                &run_dir,
-                artifact_capture,
-                capture_retryable_failure_artifacts,
-            )
+            run_browser_start_once(&context, capture_retryable_failure_artifacts)
         },
         BROWSER_START_ATTEMPTS,
         |attempt, failure| emit_browser_retry_warning(&run_dir, attempt, failure),
     )
 }
 
-fn run_browser_start_once(
-    username: &str,
-    password: &str,
-    server_id: Option<&str>,
+struct BrowserStartContext<'a> {
+    username: &'a str,
+    password: &'a str,
+    server_id: Option<&'a str>,
     headless: bool,
-    run_dir: &Path,
+    chrome_path: Option<&'a Path>,
+    run_dir: &'a Path,
     artifact_capture: ArtifactCapture,
+}
+
+fn run_browser_start_once(
+    context: &BrowserStartContext<'_>,
     capture_retryable_failure_artifacts: bool,
 ) -> Result<ProviderStartResult, ProviderStartFailure> {
     let args = vec![
@@ -129,8 +162,16 @@ fn run_browser_start_once(
     ];
 
     let options = LaunchOptions {
-        headless,
+        headless: context.headless,
+        path: context.chrome_path.map(Path::to_path_buf),
         args,
+        ignore_certificate_errors: false,
+        process_envs: Some(HashMap::from([
+            ("DISCORD_TOKEN".to_string(), String::new()),
+            ("ATERNOS_USER".to_string(), String::new()),
+            ("ATERNOS_PASS".to_string(), String::new()),
+            ("PTERODACTYL_API_TOKEN".to_string(), String::new()),
+        ])),
         ..Default::default()
     };
 
@@ -138,24 +179,26 @@ fn run_browser_start_once(
         error_class: browser_setup_error_class(&error.to_string(), "BrowserLaunch"),
         message: error.to_string(),
         screenshot_path: None,
-        html_path: None,
+        detail_artifact_path: None,
+        minecraft_address: None,
         start_may_have_been_submitted: false,
     })?;
     let tab = browser.new_tab().map_err(|error| ProviderStartFailure {
         error_class: browser_setup_error_class(&error.to_string(), "BrowserTab"),
         message: error.to_string(),
         screenshot_path: None,
-        html_path: None,
+        detail_artifact_path: None,
+        minecraft_address: None,
         start_may_have_been_submitted: false,
     })?;
 
     match run_dashboard_flow(
         &tab,
-        username,
-        password,
-        server_id,
-        run_dir,
-        artifact_capture,
+        context.username,
+        context.password,
+        context.server_id,
+        context.run_dir,
+        context.artifact_capture,
     ) {
         Ok(result) => Ok(result),
         Err(flow_failure) => {
@@ -163,22 +206,23 @@ fn run_browser_start_once(
                 error_class: classify_browser_error(&flow_failure.error),
                 message: browser_failure_message(&flow_failure.error),
                 screenshot_path: None,
-                html_path: None,
+                detail_artifact_path: None,
+                minecraft_address: None,
                 start_may_have_been_submitted: false,
             };
             apply_post_click_submission_metadata(&mut failure, flow_failure.start_clicked);
             if !is_retryable_browser_failure(&failure) || capture_retryable_failure_artifacts {
                 failure.screenshot_path = capture_screenshot_best_effort(
                     &tab,
-                    run_dir,
+                    context.run_dir,
                     FAILURE_SCREENSHOT,
-                    artifact_capture.capture_failure_screenshot(),
+                    context.artifact_capture.capture_failure_screenshot(),
                 );
-                failure.html_path = capture_html_best_effort(
+                failure.detail_artifact_path = capture_html_best_effort(
                     &tab,
-                    run_dir,
+                    context.run_dir,
                     FAILURE_HTML,
-                    artifact_capture.capture_failure_html(),
+                    context.artifact_capture.capture_failure_html(),
                 );
             }
             failure.screenshot_path = failure_screenshot_or_checkpoint(
@@ -373,9 +417,10 @@ fn run_dashboard_flow(
         } else {
             StartOutcome::DashboardChanged
         },
-        dashboard_status,
+        provider_status: dashboard_status,
+        minecraft_address: None,
         screenshot_path,
-        html_path,
+        detail_artifact_path: html_path,
     })
 }
 
@@ -1362,6 +1407,8 @@ fn capture_screenshot(
         .with_context(|| format!("BrowserCapture: could not capture screenshot {filename}"))?;
     std::fs::write(&path, png_data)
         .with_context(|| format!("ArtifactWrite: could not write screenshot {filename}"))?;
+    ensure_owner_only_file(&path)
+        .with_context(|| format!("ArtifactWrite: could not protect screenshot {filename}"))?;
     Ok(path)
 }
 
@@ -1375,6 +1422,8 @@ fn capture_html(tab: &headless_chrome::Tab, run_dir: &Path, filename: &str) -> R
         .with_context(|| format!("BrowserCapture: could not capture HTML {filename}"))?;
     std::fs::write(&path, content)
         .with_context(|| format!("ArtifactWrite: could not write HTML {filename}"))?;
+    ensure_owner_only_file(&path)
+        .with_context(|| format!("ArtifactWrite: could not protect HTML {filename}"))?;
     Ok(path)
 }
 
@@ -1921,7 +1970,8 @@ mod tests {
             message: "Unable to make method calls because underlying connection is closed"
                 .to_string(),
             screenshot_path: None,
-            html_path: None,
+            detail_artifact_path: None,
+            minecraft_address: None,
             start_may_have_been_submitted: false,
         };
 
@@ -2151,9 +2201,10 @@ mod tests {
     fn provider_success() -> ProviderStartResult {
         ProviderStartResult {
             outcome: StartOutcome::StartClicked,
-            dashboard_status: "Starting".to_string(),
+            provider_status: "Starting".to_string(),
+            minecraft_address: None,
             screenshot_path: None,
-            html_path: None,
+            detail_artifact_path: None,
         }
     }
 
@@ -2162,7 +2213,8 @@ mod tests {
             error_class: error_class.to_string(),
             message: message.to_string(),
             screenshot_path: None,
-            html_path: None,
+            detail_artifact_path: None,
+            minecraft_address: None,
             start_may_have_been_submitted: false,
         }
     }

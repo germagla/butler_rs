@@ -1,4 +1,3 @@
-use crate::config::Config;
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde_json::Value;
@@ -66,10 +65,6 @@ pub struct SrvRecord {
     pub weight: u16,
     pub port: u16,
     pub target: String,
-}
-
-pub async fn get_configured_status(config: &Config) -> Result<ServerStatus> {
-    get_status_for_addr(&config.minecraft_server_addr).await
 }
 
 pub async fn get_status_for_addr(addr: &str) -> Result<ServerStatus> {

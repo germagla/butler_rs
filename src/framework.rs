@@ -1,16 +1,14 @@
-use crate::{commands, config::Config, state::BotState, terminal};
+use crate::{commands, state::BotState, terminal};
 
 pub type Context<'a> = poise::Context<'a, BotState, anyhow::Error>;
 
-pub fn create_framework(config: Config) -> poise::Framework<BotState, anyhow::Error> {
+pub fn create_framework(state: BotState) -> poise::Framework<BotState, anyhow::Error> {
     poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![
                 commands::ping::ping(),
                 commands::server::server(),
                 commands::bot::bot(),
-                commands::aternos::aternos_start(),
-                commands::aternos::aternos_status(),
             ],
             on_error: |error| {
                 Box::pin(async move {
@@ -53,10 +51,8 @@ pub fn create_framework(config: Config) -> poise::Framework<BotState, anyhow::Er
             ..Default::default()
         })
         .setup(move |ctx, ready, framework| {
-            let config = config.clone();
+            let state = state.clone();
             Box::pin(async move {
-                terminal::emit(terminal::ready(&ready.user.name));
-
                 let commands = &framework.options().commands;
 
                 for guild in &ready.guilds {
@@ -89,7 +85,9 @@ pub fn create_framework(config: Config) -> poise::Framework<BotState, anyhow::Er
                     "complete",
                 ));
 
-                BotState::new(config)
+                terminal::emit(terminal::ready(&ready.user.name));
+
+                Ok(state)
             })
         })
         .build()

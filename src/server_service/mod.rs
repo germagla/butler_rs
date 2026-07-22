@@ -6,6 +6,6 @@ mod tracking;
 mod types;
 
 pub use queries::{last_error, run, runs};
-pub use start::{start_server, start_server_with_notice};
-pub use status::{diagnose, status, status_with_notice};
+pub use start::start_server;
+pub use status::{diagnose, status};
 pub use types::StartOptions;

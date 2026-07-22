@@ -1,18 +1,17 @@
 use super::{
     responses::{
-        edit_start_message, format_dashboard_detail, format_failure_detail, start_final_content,
+        edit_start_message, format_failure_detail, format_provider_detail, start_final_content,
         start_progress_content, with_notice,
     },
     tracking::{RunTracker, run_context},
     types::StartOptions,
 };
 use crate::{
-    aternos,
     framework::Context,
     minecraft::{self, ServerStatus},
-    provider::{ProviderStartFailure, ProviderStartResult, ServerStartProvider, StartOutcome},
+    provider::{ProviderStartFailure, ProviderStartResult, StartOutcome},
     run_history::now_ms,
-    state::ActiveStartRun,
+    state::{ActiveStartLease, ActiveStartRun, StartAdmissionError},
     terminal,
 };
 use anyhow::Result;
@@ -21,7 +20,7 @@ use tokio::time::sleep;
 
 const POST_CLICK_VERIFY_SECS: u64 = 60;
 const MINECRAFT_STATUS_POLL_SECS: u64 = 5;
-const UNCONFIRMED_ATERNOS_STATUS: &str = "Unconfirmed (browser confirmation lost)";
+const UNCONFIRMED_PROVIDER_STATUS: &str = "Unconfirmed (provider confirmation lost)";
 
 pub async fn start_server(ctx: Context<'_>, options: StartOptions) -> Result<()> {
     start_server_with_notice(ctx, options, None).await
@@ -51,26 +50,30 @@ pub async fn start_server_with_notice(
         return Ok(());
     }
 
-    if !data.begin_start_run(&context).await {
-        let active_run = data
-            .active_start_run()
-            .await
-            .unwrap_or_else(|| ActiveStartRun {
-                run_id: "unknown".to_string(),
-                guild_id: None,
-            });
-        terminal::emit(terminal::line_for_context(
-            "BUSY",
-            &context,
-            format!("{} already running", active_run.run_id),
-        ));
-        ctx.say(with_notice(
-            active_start_busy_message(ctx, &active_run, true),
-            notice,
-        ))
-        .await?;
-        return Ok(());
-    }
+    let active_lease = match data.try_begin_start_run(&context).await {
+        Ok(lease) => lease,
+        Err(StartAdmissionError::Busy(active_run)) => {
+            terminal::emit(terminal::line_for_context(
+                "BUSY",
+                &context,
+                format!("{} already running", active_run.run_id),
+            ));
+            ctx.say(with_notice(
+                active_start_busy_message(ctx, &active_run, true),
+                notice,
+            ))
+            .await?;
+            return Ok(());
+        }
+        Err(StartAdmissionError::ShuttingDown) => {
+            ctx.say(with_notice(
+                "Butler is restarting; try again shortly.".to_string(),
+                notice,
+            ))
+            .await?;
+            return Ok(());
+        }
+    };
 
     let mut tracker = RunTracker::new(ctx, context.clone());
     let mut start_details = vec![context.run_id.clone()];
@@ -97,12 +100,20 @@ pub async fn start_server_with_notice(
     {
         Ok(message) => message,
         Err(error) => {
-            data.finish_start_run(&context.run_id).await;
+            active_lease.finish().await;
             return Err(error.into());
         }
     };
 
-    let result = start_server_inner(ctx, options, &mut tracker, &progress_message, notice).await;
+    let result = start_server_inner(
+        ctx,
+        options,
+        &mut tracker,
+        &progress_message,
+        notice,
+        &active_lease,
+    )
+    .await;
 
     let edit_result = if let Err(error) = result {
         tracker
@@ -117,7 +128,6 @@ pub async fn start_server_with_notice(
                 terminal::clean(&error.to_string())
             ),
         ));
-        data.finish_start_run(&context.run_id).await;
         Some(
             edit_start_message(
                 ctx,
@@ -133,9 +143,9 @@ pub async fn start_server_with_notice(
             .await,
         )
     } else {
-        data.finish_start_run(&context.run_id).await;
         None
     };
+    active_lease.finish().await;
 
     if let Err(error) = data.run_store.prune_artifacts().await {
         terminal::emit(terminal::line_for_context(
@@ -208,12 +218,12 @@ async fn start_server_inner(
     tracker: &mut RunTracker<'_>,
     progress_message: &poise::ReplyHandle<'_>,
     notice: Option<&str>,
+    active_lease: &ActiveStartLease,
 ) -> Result<()> {
-    let config = ctx.data().config.clone();
-
     let mut preflight_status = None;
     if !options.force {
-        match minecraft::get_configured_status(&config).await {
+        let minecraft_address = ctx.data().minecraft_address().await;
+        match minecraft::get_status_for_addr(&minecraft_address).await {
             Ok(status) => {
                 let status_text = status.to_string();
                 tracker
@@ -277,10 +287,26 @@ async fn start_server_inner(
             .await;
     }
 
-    match aternos::BrowserAternosProvider
-        .start(&config, &tracker.context.run_id)
-        .await
-    {
+    let provider = ctx.data().provider.clone();
+    let state = ctx.data().clone();
+    let run_id = tracker.context.run_id.clone();
+    let operation_guard = active_lease.operation_guard();
+    let provider_result = tokio::spawn(async move {
+        let result = provider.start(&run_id).await;
+        let provider_address = match &result {
+            Ok(result) => result.minecraft_address.as_ref(),
+            Err(failure) => failure.minecraft_address.as_ref(),
+        };
+        if let Some(address) = provider_address {
+            state.set_minecraft_address(address.to_string()).await;
+        }
+        drop(operation_guard);
+        result
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("provider operation task failed: {error}"))?;
+
+    match provider_result {
         Ok(provider_result) => {
             handle_provider_success(
                 ctx,
@@ -322,11 +348,11 @@ async fn handle_provider_success(
     let screenshot_path = provider_result.screenshot_path.clone();
     tracker
         .step(
-            "aternos_dashboard",
+            "provider_start",
             &provider_result.outcome.to_string(),
-            Some(format_dashboard_detail(
-                &provider_result.dashboard_status,
-                provider_result.html_path.as_ref(),
+            Some(format_provider_detail(
+                &provider_result.provider_status,
+                provider_result.detail_artifact_path.as_ref(),
             )),
             screenshot_path.clone(),
             None,
@@ -337,6 +363,8 @@ async fn handle_provider_success(
     let mut outcome = match provider_result.outcome {
         StartOutcome::StartClicked => "StartClicked".to_string(),
         StartOutcome::DashboardChanged => "DashboardChanged".to_string(),
+        StartOutcome::StartRequested => "StartRequested".to_string(),
+        StartOutcome::AlreadyActive => "AlreadyActive".to_string(),
     };
     let mut final_error_class = None;
 
@@ -365,7 +393,8 @@ async fn handle_provider_success(
 
     let content = start_final_content(
         &tracker.context.run_id,
-        &provider_result.dashboard_status,
+        ctx.data().provider.name(),
+        &provider_result.provider_status,
         &outcome,
     );
 
@@ -380,7 +409,7 @@ async fn handle_provider_success(
     tracker
         .finish(
             &outcome,
-            Some(provider_result.dashboard_status),
+            Some(provider_result.provider_status),
             final_minecraft_status,
             screenshot_path,
             final_error_class,
@@ -407,7 +436,8 @@ async fn wait_for_minecraft_online(
         .saturating_add((ctx.data().config.start_wait_online_secs as u128) * 1000);
 
     loop {
-        match minecraft::get_configured_status(&ctx.data().config).await {
+        let minecraft_address = ctx.data().minecraft_address().await;
+        match minecraft::get_status_for_addr(&minecraft_address).await {
             Ok(status @ ServerStatus::Online { .. }) => {
                 final_minecraft_status = Some(status.to_string());
                 outcome = "MinecraftOnline".to_string();
@@ -483,7 +513,8 @@ async fn verify_submitted_start(
     let deadline = now_ms().saturating_add((POST_CLICK_VERIFY_SECS as u128) * 1000);
 
     loop {
-        match minecraft::get_configured_status(&ctx.data().config).await {
+        let minecraft_address = ctx.data().minecraft_address().await;
+        match minecraft::get_status_for_addr(&minecraft_address).await {
             Ok(status) => {
                 let status_text = status.to_string();
                 let confirmed = status_confirms_start_submission(&status);
@@ -561,7 +592,7 @@ async fn handle_provider_failure(
     let screenshot_path = failure.screenshot_path.clone();
     tracker
         .step(
-            "aternos_dashboard",
+            "provider_start",
             "failed",
             Some(format_failure_detail(&failure)),
             screenshot_path.clone(),
@@ -602,7 +633,7 @@ async fn handle_unconfirmed_submitted_start(
     let screenshot_path = failure.screenshot_path.clone();
     tracker
         .step(
-            "aternos_dashboard",
+            "provider_start",
             "StartSubmittedUnconfirmed",
             Some(format_failure_detail(&failure)),
             screenshot_path.clone(),
@@ -650,7 +681,11 @@ async fn handle_unconfirmed_submitted_start(
                 ctx,
                 progress_message,
                 notice,
-                start_submitted_unconfirmed_wait_final_content(&tracker.context.run_id, &outcome),
+                start_submitted_unconfirmed_wait_final_content(
+                    &tracker.context.run_id,
+                    ctx.data().provider.name(),
+                    &outcome,
+                ),
                 screenshot_path.clone(),
             )
             .await?;
@@ -668,7 +703,7 @@ async fn handle_unconfirmed_submitted_start(
         tracker
             .finish(
                 &outcome,
-                Some(UNCONFIRMED_ATERNOS_STATUS.to_string()),
+                Some(UNCONFIRMED_PROVIDER_STATUS.to_string()),
                 final_minecraft_status,
                 screenshot_path,
                 final_error_class,
@@ -689,7 +724,7 @@ async fn handle_unconfirmed_submitted_start(
     tracker
         .finish(
             "StartSubmissionUnverified",
-            Some(UNCONFIRMED_ATERNOS_STATUS.to_string()),
+            Some(UNCONFIRMED_PROVIDER_STATUS.to_string()),
             final_minecraft_status,
             screenshot_path,
             Some("StartSubmissionUnverified".to_string()),
@@ -712,16 +747,20 @@ fn start_submission_checking_content(run_id: &str) -> String {
 
 fn start_submitted_unconfirmed_content(run_id: &str, status: &ServerStatus) -> String {
     format!(
-        "Start appears submitted, but browser confirmation was lost.\nMinecraft: **{status}**\nRun: `{run_id}`"
+        "Start appears submitted, but provider confirmation was lost.\nMinecraft: **{status}**\nRun: `{run_id}`"
     )
 }
 
-fn start_submitted_unconfirmed_wait_final_content(run_id: &str, outcome: &str) -> String {
-    start_final_content(run_id, UNCONFIRMED_ATERNOS_STATUS, outcome)
+fn start_submitted_unconfirmed_wait_final_content(
+    run_id: &str,
+    provider_name: &str,
+    outcome: &str,
+) -> String {
+    start_final_content(run_id, provider_name, UNCONFIRMED_PROVIDER_STATUS, outcome)
 }
 
 fn start_submission_unverified_content(run_id: &str) -> String {
-    format!("Start could not be verified after browser confirmation was lost.\nRun: `{run_id}`")
+    format!("Start could not be verified after provider confirmation was lost.\nRun: `{run_id}`")
 }
 
 #[cfg(test)]
@@ -800,15 +839,19 @@ mod tests {
         assert!(accepted.contains("Minecraft: **Starting**"));
         assert!(accepted.contains("Run: `abc123`"));
 
-        let wait_done = start_submitted_unconfirmed_wait_final_content("abc123", "MinecraftOnline");
+        let wait_done = start_submitted_unconfirmed_wait_final_content(
+            "abc123",
+            "pterodactyl",
+            "MinecraftOnline",
+        );
         assert!(wait_done.contains("Server is online."));
-        assert!(wait_done.contains("Aternos: **Unconfirmed"));
+        assert!(wait_done.contains("Provider (pterodactyl): **Unconfirmed"));
         assert!(wait_done.contains("Run: `abc123`"));
 
         let unverified = start_submission_unverified_content("abc123");
         assert_eq!(
             unverified,
-            "Start could not be verified after browser confirmation was lost.\nRun: `abc123`"
+            "Start could not be verified after provider confirmation was lost.\nRun: `abc123`"
         );
     }
 }

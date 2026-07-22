@@ -1,6 +1,7 @@
 use super::tracking::run_context;
 use crate::{
     auth::{self, SensitiveCommandAccess},
+    config::ProviderConfig,
     framework::Context,
     minecraft,
     run_history::now_ms,
@@ -22,13 +23,13 @@ pub async fn status_with_notice(ctx: Context<'_>, notice: Option<&str>) -> Resul
     let context = run_context(ctx, "server.status");
     let started_at_ms = now_ms();
 
-    match minecraft::get_configured_status(&ctx.data().config).await {
+    let minecraft_address = ctx.data().minecraft_address().await;
+    match minecraft::get_status_for_addr(&minecraft_address).await {
         Ok(status) => {
             let status_text = status.to_string();
             ctx.say(format!(
                 "Status for `{}`: **{}**",
-                ctx.data().config.minecraft_server_addr,
-                status_text
+                minecraft_address, status_text
             ))
             .await?;
             terminal::emit(terminal::line_for_context(
@@ -65,18 +66,19 @@ pub async fn diagnose(ctx: Context<'_>) -> Result<()> {
     let context = run_context(ctx, "server.diagnose");
     let started_at_ms = now_ms();
     let config = &ctx.data().config;
+    let minecraft_address = ctx.data().minecraft_address().await;
     let active_run = ctx.data().active_start_run().await;
     let active = active_run_display(active_run.as_ref(), &access);
-    let status = minecraft::get_configured_status(config)
+    let status = minecraft::get_status_for_addr(&minecraft_address)
         .await
         .map(|status| status.to_string())
         .unwrap_or_else(|error| format!("error: {error}"));
+    let provider = provider_diagnostics(&config.provider);
 
     let response = format!(
-        "Diagnostics\nServer address: `{}`\nAternos server id: `{}`\nHeadless: `{}`\nArtifact dir: `{}`\nArtifact capture: `{}`\nAttach screenshots: `{}`\nPersist events: `{}`\nRedact events: `{}`\nConfigured owners: `{}`\nActive start run: `{}`\nMinecraft status: **{}**",
-        config.minecraft_server_addr,
-        config.server_id.as_deref().unwrap_or("not configured"),
-        config.headless,
+        "Diagnostics\nServer address: `{}`\n{}\nArtifact dir: `{}`\nArtifact capture: `{}`\nAttach screenshots: `{}`\nPersist events: `{}`\nRedact events: `{}`\nConfigured owners: `{}`\nActive start run: `{}`\nMinecraft status: **{}**",
+        minecraft_address,
+        provider,
         config.artifact_dir.display(),
         config.artifact_capture,
         config.attach_screenshots,
@@ -103,6 +105,24 @@ pub async fn diagnose(ctx: Context<'_>) -> Result<()> {
         ),
     ));
     Ok(())
+}
+
+fn provider_diagnostics(provider: &ProviderConfig) -> String {
+    match provider {
+        ProviderConfig::Aternos(config) => format!(
+            "Provider: `aternos`\nAternos server id: `{}`\nHeadless: `{}`",
+            config.server_id.as_deref().unwrap_or("not configured"),
+            config.headless
+        ),
+        ProviderConfig::Pterodactyl(config) => format!(
+            "Provider: `pterodactyl`\nPanel: `{}`\nPterodactyl server id: `{}`\nPower enabled: `{}`\nFlareSolverr: `{}`\nFlareSolverr container: `{}`",
+            config.panel_origin,
+            config.server_id,
+            config.power_enabled,
+            config.flaresolverr_url,
+            config.flaresolverr_container
+        ),
+    }
 }
 
 fn active_run_display(

@@ -23,6 +23,8 @@ const ARTIFACT_WRITE_PROBE_PREFIX: &str = ".butler-write-probe";
 pub struct RunContext {
     pub run_id: String,
     pub command: String,
+    #[serde(default = "default_provider_name")]
+    pub provider: String,
     pub guild_id: Option<String>,
     pub guild_name: String,
     pub channel_id: String,
@@ -49,11 +51,16 @@ pub struct RunSummary {
     pub finished_at_ms: u128,
     pub duration_ms: u128,
     pub outcome: String,
-    pub final_aternos_status: Option<String>,
+    #[serde(alias = "final_aternos_status")]
+    pub final_provider_status: Option<String>,
     pub final_minecraft_status: Option<String>,
     pub screenshot_path: Option<String>,
     pub error_class: Option<String>,
     pub steps: Vec<RunStep>,
+}
+
+fn default_provider_name() -> String {
+    "aternos".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,13 +161,14 @@ impl RunStore {
         }
 
         if let Some(parent) = self.event_file.parent() {
-            fs::create_dir_all(parent)?;
+            ensure_owner_only_dir(parent)?;
         }
 
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.event_file.as_ref())?;
+        ensure_owner_only_file(self.event_file.as_ref())?;
         let event = if self.redact_events {
             event.redacted()
         } else {
@@ -175,6 +183,7 @@ impl RunStore {
         limit: usize,
         rotate_unredacted_events: bool,
     ) -> Result<Option<EventFileMaintenance>> {
+        harden_existing_artifact_permissions(artifact_dir)?;
         let rotated = if rotate_unredacted_events {
             maintain_event_file_if_needed(artifact_dir)?
         } else {
@@ -218,17 +227,20 @@ pub fn now_ms() -> u128 {
 }
 
 pub fn mark_run_artifact_dir(run_dir: &Path) -> Result<()> {
-    fs::write(run_dir.join(RUN_DIR_MARKER), "butler-run\n").with_context(|| {
+    ensure_owner_only_dir(run_dir)?;
+    let marker = run_dir.join(RUN_DIR_MARKER);
+    fs::write(&marker, "butler-run\n").with_context(|| {
         format!(
             "ArtifactWrite: could not write marker in {}",
             run_dir.display()
         )
     })?;
+    ensure_owner_only_file(&marker)?;
     Ok(())
 }
 
 pub fn verify_artifact_dir_writable(artifact_dir: &Path) -> Result<()> {
-    fs::create_dir_all(artifact_dir).with_context(|| {
+    ensure_owner_only_dir(artifact_dir).with_context(|| {
         format!(
             "ArtifactWrite: could not create artifact dir {}",
             artifact_dir.display()
@@ -286,15 +298,71 @@ pub fn maintain_event_file_if_needed(artifact_dir: &Path) -> Result<Option<Event
         EventFileInspection::Unredacted => {
             let backup = backup_event_path(artifact_dir, "unredacted");
             fs::rename(&event_file, &backup)?;
+            ensure_owner_only_file(&backup)?;
             EventFileMaintenance::RotatedUnredacted(backup)
         }
         EventFileInspection::Corrupt => {
             let backup = backup_event_path(artifact_dir, "corrupt");
             fs::rename(&event_file, &backup)?;
+            ensure_owner_only_file(&backup)?;
             EventFileMaintenance::QuarantinedCorrupt(backup)
         }
     };
     Ok(Some(maintenance))
+}
+
+pub fn ensure_owner_only_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    set_owner_only_mode(path, true)
+}
+
+pub fn ensure_owner_only_file(path: &Path) -> Result<()> {
+    set_owner_only_mode(path, false)
+}
+
+fn harden_existing_artifact_permissions(artifact_dir: &Path) -> Result<()> {
+    ensure_owner_only_dir(artifact_dir)?;
+    for entry in fs::read_dir(artifact_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_file() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("events") && name.ends_with(".jsonl") {
+                ensure_owner_only_file(&path)?;
+            }
+            continue;
+        }
+        if !file_type.is_dir() || !is_butler_run_artifact_dir(&path) {
+            continue;
+        }
+        set_owner_only_mode(&path, true)?;
+        for artifact in fs::read_dir(&path)? {
+            let artifact = artifact?;
+            if artifact.file_type()?.is_file() {
+                ensure_owner_only_file(&artifact.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_mode(path: &Path, directory: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if directory { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_mode(_path: &Path, _directory: bool) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -450,10 +518,39 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn artifact_permissions_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_artifact_dir("private_permissions");
+        ensure_owner_only_dir(&dir).unwrap();
+        let run_dir = dir.join("abc123");
+        mark_run_artifact_dir(&run_dir).unwrap();
+        let artifact = run_dir.join("failure.html");
+        fs::write(&artifact, "secret").unwrap();
+        ensure_owner_only_file(&artifact).unwrap();
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn sample_context() -> RunContext {
         RunContext {
             run_id: "abc123".to_string(),
             command: "server.start".to_string(),
+            provider: "aternos".to_string(),
             guild_id: Some("guild-1".to_string()),
             guild_name: "Guild".to_string(),
             channel_id: "channel-1".to_string(),
@@ -488,7 +585,7 @@ mod tests {
             finished_at_ms: 2,
             duration_ms: 1,
             outcome: if failed { "Failed" } else { "StartClicked" }.to_string(),
-            final_aternos_status: None,
+            final_provider_status: None,
             final_minecraft_status: None,
             screenshot_path: None,
             error_class: failed.then(|| "StartNotAccepted".to_string()),

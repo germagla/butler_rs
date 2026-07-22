@@ -79,7 +79,7 @@ impl<'a> RunTracker<'a> {
     pub(super) async fn finish(
         &mut self,
         outcome: &str,
-        final_aternos_status: Option<String>,
+        final_provider_status: Option<String>,
         final_minecraft_status: Option<String>,
         screenshot_path: Option<PathBuf>,
         error_class: Option<String>,
@@ -91,7 +91,7 @@ impl<'a> RunTracker<'a> {
             finished_at_ms,
             duration_ms: finished_at_ms.saturating_sub(self.started_at_ms),
             outcome: outcome.to_string(),
-            final_aternos_status,
+            final_provider_status,
             final_minecraft_status,
             screenshot_path: screenshot_path.map(|path| path.display().to_string()),
             error_class,
@@ -126,6 +126,7 @@ pub(super) fn run_context(ctx: Context<'_>, command: &str) -> RunContext {
     RunContext {
         run_id: generate_run_id(),
         command: command.to_string(),
+        provider: ctx.data().provider.name().to_string(),
         guild_id,
         guild_name,
         channel_id: channel_id.to_string(),

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{collections::HashSet, env, path::PathBuf};
+use url::Url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtifactCapture {
@@ -39,14 +40,53 @@ impl std::fmt::Display for ArtifactCapture {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerProviderKind {
+    Aternos,
+    Pterodactyl,
+}
+
+impl std::fmt::Display for ServerProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Aternos => write!(f, "aternos"),
+            Self::Pterodactyl => write!(f, "pterodactyl"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AternosConfig {
+    pub user: String,
+    pub password: String,
+    pub server_id: Option<String>,
+    pub headless: bool,
+    pub chrome_path: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+pub struct PterodactylConfig {
+    pub panel_origin: Url,
+    pub server_id: String,
+    pub api_token: String,
+    pub power_enabled: bool,
+    pub flaresolverr_url: Url,
+    pub flaresolverr_container: String,
+    pub orbctl_path: PathBuf,
+    pub docker_path: PathBuf,
+}
+
+#[derive(Clone)]
+pub enum ProviderConfig {
+    Aternos(AternosConfig),
+    Pterodactyl(PterodactylConfig),
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub discord_token: String,
-    pub aternos_user: String,
-    pub aternos_pass: String,
+    pub provider: ProviderConfig,
     pub minecraft_server_addr: String,
-    pub server_id: Option<String>,
-    pub headless: bool,
     pub start_wait_online_secs: u64,
     pub run_history_limit: usize,
     pub artifact_dir: PathBuf,
@@ -60,19 +100,41 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let discord_token = required_var("DISCORD_TOKEN")?;
-        let aternos_user = required_var("ATERNOS_USER")?;
-        let aternos_pass = required_var("ATERNOS_PASS")?;
+        let provider_kind = provider_kind_var("SERVER_PROVIDER")?;
+        let provider = match provider_kind {
+            ServerProviderKind::Aternos => ProviderConfig::Aternos(AternosConfig {
+                user: required_var("ATERNOS_USER")?,
+                password: required_var("ATERNOS_PASS")?,
+                server_id: optional_nonempty_var("ATERNOS_SERVER_ID")
+                    .or_else(|| optional_nonempty_var("SERVER_ID")),
+                headless: bool_var("HEADLESS", true)?,
+                chrome_path: optional_nonempty_var("CHROME").map(PathBuf::from),
+            }),
+            ServerProviderKind::Pterodactyl => ProviderConfig::Pterodactyl(PterodactylConfig {
+                panel_origin: panel_origin_var("PTERODACTYL_PANEL_URL")?,
+                server_id: pterodactyl_server_id_var("PTERODACTYL_SERVER_ID")?,
+                api_token: required_nonempty_var("PTERODACTYL_API_TOKEN")?,
+                power_enabled: bool_var("PTERODACTYL_POWER_ENABLED", false)?,
+                flaresolverr_url: flaresolverr_url_var("FLARESOLVERR_URL")?,
+                flaresolverr_container: container_name_var("FLARESOLVERR_CONTAINER")?,
+                orbctl_path: PathBuf::from(
+                    optional_nonempty_var("ORBSTACK_BIN")
+                        .unwrap_or_else(|| "/opt/homebrew/bin/orbctl".to_string()),
+                ),
+                docker_path: PathBuf::from(
+                    optional_nonempty_var("DOCKER_BIN")
+                        .unwrap_or_else(|| "/usr/local/bin/docker".to_string()),
+                ),
+            }),
+        };
         let minecraft_server_addr =
             env::var("MINECRAFT_SERVER_ADDR").unwrap_or_else(|_| "localhost:25565".to_string());
         bool_var("BUTLER_COLOR", true)?;
 
         Ok(Self {
             discord_token,
-            aternos_user,
-            aternos_pass,
+            provider,
             minecraft_server_addr,
-            server_id: optional_nonempty_var("SERVER_ID"),
-            headless: bool_var("HEADLESS", true)?,
             start_wait_online_secs: u64_var("START_WAIT_ONLINE_SECS", 600)?,
             run_history_limit: usize_var("RUN_HISTORY_LIMIT", 20)?,
             artifact_dir: PathBuf::from(
@@ -94,8 +156,115 @@ fn required_var(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} must be set"))
 }
 
+fn required_nonempty_var(name: &str) -> Result<String> {
+    let value = required_var(name)?;
+    if value.trim().is_empty() {
+        bail!("{name} must not be empty");
+    }
+    Ok(value.trim().to_string())
+}
+
 fn optional_nonempty_var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn provider_kind_var(name: &str) -> Result<ServerProviderKind> {
+    let value = required_nonempty_var(name)?;
+    parse_provider_kind(&value)
+        .with_context(|| format!("{name} must be one of aternos, pterodactyl"))
+}
+
+fn parse_provider_kind(value: &str) -> Result<ServerProviderKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "aternos" => Ok(ServerProviderKind::Aternos),
+        "pterodactyl" => Ok(ServerProviderKind::Pterodactyl),
+        other => bail!("unsupported server provider `{other}`"),
+    }
+}
+
+fn panel_origin_var(name: &str) -> Result<Url> {
+    parse_panel_origin(&required_nonempty_var(name)?)
+        .with_context(|| format!("{name} must be an HTTPS origin without credentials or a path"))
+}
+
+fn parse_panel_origin(value: &str) -> Result<Url> {
+    let mut url = Url::parse(value).context("invalid URL")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!("panel URL must be an HTTPS origin");
+    }
+    url.set_path("/");
+    Ok(url)
+}
+
+fn flaresolverr_url_var(name: &str) -> Result<Url> {
+    let value = optional_nonempty_var(name).unwrap_or_else(|| "http://127.0.0.1:8191/".to_string());
+    parse_flaresolverr_url(&value)
+        .with_context(|| format!("{name} must be an HTTP loopback origin"))
+}
+
+fn parse_flaresolverr_url(value: &str) -> Result<Url> {
+    let mut url = Url::parse(value).context("invalid URL")?;
+    let is_loopback = match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    };
+    if url.scheme() != "http"
+        || !is_loopback
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!("FlareSolverr URL must be an HTTP loopback origin");
+    }
+    url.set_path("/");
+    Ok(url)
+}
+
+fn container_name_var(name: &str) -> Result<String> {
+    let value = optional_nonempty_var(name).unwrap_or_else(|| "flaresolverr".to_string());
+    if value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+    {
+        bail!("{name} contains an invalid Docker container name");
+    }
+    Ok(value)
+}
+
+fn pterodactyl_server_id_var(name: &str) -> Result<String> {
+    let value = required_nonempty_var(name)?;
+    parse_pterodactyl_server_id(&value)
+        .with_context(|| format!("{name} contains an invalid server identifier"))
+}
+
+fn parse_pterodactyl_server_id(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+    {
+        bail!("invalid server identifier");
+    }
+    Ok(value.to_string())
 }
 
 fn bool_var(name: &str, default: bool) -> Result<bool> {
@@ -249,5 +418,52 @@ mod tests {
         assert_eq!(usize_var_value(Some("3"), 20).unwrap(), 3);
         assert_eq!(usize_var_value(None, 20).unwrap(), 20);
         assert!(usize_var_value(Some("many"), 20).is_err());
+    }
+
+    #[test]
+    fn parses_required_provider_kind() {
+        assert_eq!(
+            parse_provider_kind("aternos").unwrap(),
+            ServerProviderKind::Aternos
+        );
+        assert_eq!(
+            parse_provider_kind(" PTERODACTYL ").unwrap(),
+            ServerProviderKind::Pterodactyl
+        );
+        assert!(parse_provider_kind("automatic").is_err());
+    }
+
+    #[test]
+    fn validates_panel_origin() {
+        assert_eq!(
+            parse_panel_origin("https://panel.play.hosting")
+                .unwrap()
+                .as_str(),
+            "https://panel.play.hosting/"
+        );
+        assert!(parse_panel_origin("http://panel.play.hosting").is_err());
+        assert!(parse_panel_origin("https://user@example.com").is_err());
+        assert!(parse_panel_origin("https://example.com/account").is_err());
+    }
+
+    #[test]
+    fn validates_loopback_flaresolverr_url() {
+        assert_eq!(
+            parse_flaresolverr_url("http://127.0.0.1:8191")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8191/"
+        );
+        assert!(parse_flaresolverr_url("http://localhost:8191").is_ok());
+        assert!(parse_flaresolverr_url("http://192.168.1.5:8191").is_err());
+        assert!(parse_flaresolverr_url("https://127.0.0.1:8191").is_err());
+    }
+
+    #[test]
+    fn validates_pterodactyl_server_identifier() {
+        assert_eq!(parse_pterodactyl_server_id("34634dd7").unwrap(), "34634dd7");
+        assert!(parse_pterodactyl_server_id("../server").is_err());
+        assert!(parse_pterodactyl_server_id("server name").is_err());
+        assert!(parse_pterodactyl_server_id("").is_err());
     }
 }

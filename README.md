@@ -4,7 +4,7 @@
 
 A Rust-powered Discord operations bot for community infrastructure, game-server workflows, diagnostics, and future AI utilities.
 
-The repository is named `butler_rs`, but the product identity is Butler. The current server integration is a browser-backed Aternos provider for Minecraft operations. The service layer uses provider-neutral start result and failure types so future providers can be added without changing command handling.
+The repository is named `butler_rs`, but the product identity is Butler. Butler can start one configured Minecraft server through either Play Hosting's Pterodactyl API or the browser-backed Aternos provider.
 
 ## Current Features
 
@@ -14,7 +14,6 @@ The repository is named `butler_rs`, but the product identity is Butler. The cur
 - `/bot runs` lists recent completed start runs kept in memory.
 - `/bot run` shows details for a specific run ID.
 - `/bot last-error` shows the most recent failed run.
-- Temporary legacy aliases: `/aternos_start` and `/aternos_status`.
 - Terminal diagnostics for local operation.
 - Local screenshots, HTML captures, and JSONL event diagnostics with redaction and retention controls.
 
@@ -24,8 +23,6 @@ The repository is named `butler_rs`, but the product identity is Butler. The cur
 | --- | --- |
 | `/server start` | Public |
 | `/server status` | Public |
-| `/aternos_start` | Public deprecated alias |
-| `/aternos_status` | Public deprecated alias |
 | `/server diagnose` | Bot owner or guild Administrator |
 | `/bot runs` | Bot owner or guild Administrator |
 | `/bot run` | Bot owner or guild Administrator |
@@ -45,7 +42,8 @@ flowchart LR
     Queries["Run history queries"]
     Minecraft["Minecraft status"]
     Provider["ServerStartProvider"]
-    Aternos["Browser Aternos provider"]
+    Providers["Aternos or Pterodactyl provider"]
+    FlareSolverr["FlareSolverr supervisor"]
     History["Run history"]
     Artifacts["Local artifacts"]
 
@@ -56,8 +54,9 @@ flowchart LR
     Service --> Queries
     Start --> Minecraft
     Start --> Provider
-    Provider --> Aternos
-    Aternos --> Artifacts
+    Provider --> Providers
+    Providers --> Artifacts
+    FlareSolverr --> Providers
     Start --> History
     Queries --> History
     History --> Artifacts
@@ -70,7 +69,7 @@ The active start lock is process-local and global, which is appropriate for the 
 ## Local Setup
 
 1. Install Rust.
-2. Install Chrome or Chromium for `/server start`; set `CHROME=/path/to/chrome-or-chromium` in `.env` if it is not auto-detected.
+2. For Aternos, install Chrome or Chromium. For Pterodactyl on macOS, install OrbStack and configure the isolated `flaresolverr` container described below.
 3. Copy `.env.example` to `.env`.
 4. Fill in Discord, provider, Minecraft, and owner settings.
 5. Run the bot:
@@ -94,6 +93,12 @@ Install Butler as a per-user LaunchAgent so it starts after login and restarts i
 ```
 
 The installer builds the release binary, restricts `.env` to owner-only access, and runs the binary with the repository as its working directory. Re-run the installer after code changes to rebuild and restart the service.
+
+Validate `.env` without connecting to Discord or starting local runtime services:
+
+```bash
+cargo run --release -- --check-config
+```
 
 Do not also run `cargo run --release` while the LaunchAgent is loaded, because that starts a second bot process. For an interactive run, unload the service first, then re-run the installer when finished:
 
@@ -120,11 +125,19 @@ Remove automatic startup without deleting logs or run artifacts:
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | Discord bot token. | Required |
-| `ATERNOS_USER` | Username for the current Aternos browser adapter. | Required |
-| `ATERNOS_PASS` | Password for the current Aternos browser adapter. | Required |
+| `SERVER_PROVIDER` | Active provider: `pterodactyl` or `aternos`. | Required |
 | `MINECRAFT_SERVER_ADDR` | Minecraft address used by status, diagnose, and start preflight. | `localhost:25565` |
-| `SERVER_ID` | Optional provider-specific server selector. | Empty |
-| `HEADLESS` | Run browser automation headlessly. | `true` |
+| `PTERODACTYL_PANEL_URL` | HTTPS panel origin. | Required for Pterodactyl |
+| `PTERODACTYL_SERVER_ID` | Pterodactyl server identifier. | Required for Pterodactyl |
+| `PTERODACTYL_API_TOKEN` | Pterodactyl client API token. | Required for Pterodactyl |
+| `PTERODACTYL_POWER_ENABLED` | Allow the provider to issue the start power action. | `false` |
+| `FLARESOLVERR_URL` | Loopback-only FlareSolverr endpoint. | `http://127.0.0.1:8191/` |
+| `FLARESOLVERR_CONTAINER` | Existing isolated Docker container Butler supervises. | `flaresolverr` |
+| `ORBSTACK_BIN` | Optional OrbStack CLI override. | `/opt/homebrew/bin/orbctl` |
+| `DOCKER_BIN` | Optional Docker CLI override. | `/usr/local/bin/docker` |
+| `ATERNOS_USER` / `ATERNOS_PASS` | Browser credentials. | Required for Aternos |
+| `ATERNOS_SERVER_ID` | Optional Aternos server selector. | Empty |
+| `HEADLESS` / `CHROME` | Aternos browser settings. | `true` / auto-detect |
 | `START_WAIT_ONLINE_SECS` | Max wait when `/server start wait_online:true` is used. | `600` |
 | `RUN_HISTORY_LIMIT` | Completed runs retained in memory and newest artifact run directories retained locally. | `20` |
 | `ARTIFACT_DIR` | Local diagnostics directory. | `artifacts/runs` |
@@ -138,11 +151,21 @@ Remove automatic startup without deleting logs or run artifacts:
 
 Invalid boolean, numeric, owner ID, artifact capture, log level, and color values fail startup instead of falling back silently.
 
+### FlareSolverr Lifecycle
+
+In Pterodactyl mode, Butler starts OrbStack when necessary, starts `flaresolverr`, verifies its loopback readiness endpoint, and keeps it healthy for Butler's process lifetime. A local ownership marker preserves this responsibility across Butler crashes and LaunchAgent restarts. On graceful shutdown Butler stops FlareSolverr only when it owns the container. Butler never stops OrbStack because that would interrupt unrelated containers.
+
+The expected media-stack configuration keeps FlareSolverr behind its own Compose profile, uses restart policy `no`, pins the image by digest, binds host port `8191` only to `127.0.0.1`, and preserves the internal `http://flaresolverr:8191/` endpoint for Prowlarr. Butler validates these properties before starting the configured container and restarts it after a bounded readiness failure. Docker and OrbStack child processes receive a minimal environment without Butler or provider secrets. The API token is sent only by Butler to the exact configured HTTPS panel origin; FlareSolverr receives no API credentials.
+
+For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It waits for an active allocation, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag. Each mutating request is issued at most once; ambiguous wake responses are checked through the read-only sleep-status endpoint, ambiguous power responses are checked through Pterodactyl resources, and Minecraft status remains the service-level fallback.
+
+Cloudflare clearance is kept in memory and requested from FlareSolverr with a 180-second challenge budget. A transient FlareSolverr availability failure is retried once before any provider mutation.
+
 ## Artifact Policy
 
 Artifacts are local diagnostics only and are ignored by git. Screenshots are treated as operational diagnostics so the current browser/dashboard state is easy to inspect locally and, when available, in Discord responses.
 
-`ARTIFACT_CAPTURE` controls local browser artifacts:
+`ARTIFACT_CAPTURE` controls local browser artifacts for Aternos:
 
 | Value | Success capture | Failure capture |
 | --- | --- | --- |
@@ -154,6 +177,10 @@ Artifacts are local diagnostics only and are ignored by git. Screenshots are tre
 `events.jsonl` persists step-level run events by default. With `BUTLER_REDACT_RUN_EVENTS=true`, Discord user IDs, user names, guild/channel IDs, and guild/channel names are redacted. On startup, if redaction is enabled and an existing `events.jsonl` appears unredacted, Butler rotates it to `events.unredacted.backup.jsonl`; unreadable or corrupt event logs are quarantined to `events.corrupt.backup.jsonl` before new events are written.
 
 When artifact capture or run-event persistence is enabled, Butler verifies on startup that `ARTIFACT_DIR` can be created, written, and cleaned up. Artifact writes during a run are diagnostic-only: if a screenshot, HTML, or marker file cannot be written, the command continues and logs a warning. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
+
+Butler creates artifact directories with owner-only permissions (`0700`) and artifact/event files with owner-only permissions (`0600`) on Unix. Startup also repairs permissions on recognized existing Butler run directories and `events*.jsonl` files without touching unknown directories or symlinks.
+
+Pterodactyl runs write a sanitized `provider_state.json` containing only provider state, suspension status, and limbo status. They do not produce authenticated dashboard screenshots because FlareSolverr is used only to obtain Cloudflare clearance; the API token is never injected into a browser session.
 
 ## Docker
 
@@ -167,15 +194,19 @@ Run with a named artifact volume:
 
 ```bash
 docker volume create butler_rs_artifacts
-docker run --rm --env-file .env -e ARTIFACT_DIR=/data/artifacts/runs -v butler_rs_artifacts:/data/artifacts/runs butler_rs
+docker run --rm --env-file .env -e SERVER_PROVIDER=aternos -e ARTIFACT_DIR=/data/artifacts/runs -v butler_rs_artifacts:/data/artifacts/runs butler_rs
 ```
 
-The Docker runtime uses Debian with Chromium installed, sets `HEADLESS=true`, sets `CHROME=/usr/bin/chromium`, and documents `/data/artifacts/runs` as the container artifact directory. The explicit `-e ARTIFACT_DIR=/data/artifacts/runs` matters if your local `.env` was copied from `.env.example`, because that file uses `artifacts/runs` for non-container development. If you bind-mount a host directory on Linux, make it writable by UID `10001`, for example `mkdir -p artifacts/runs && sudo chown -R 10001:10001 artifacts/runs`.
+The Docker runtime supports the Aternos provider and uses Debian with Chromium installed. Pterodactyl mode is intentionally limited to local macOS operation because it manages OrbStack through local CLI tools; do not mount the host Docker socket into Butler. The explicit `-e ARTIFACT_DIR=/data/artifacts/runs` matters if your local `.env` uses `artifacts/runs`. If you bind-mount a host directory on Linux, make it writable by UID `10001`, for example `mkdir -p artifacts/runs && sudo chown -R 10001:10001 artifacts/runs`.
+
+## Upgrading To v0.4
+
+`SERVER_PROVIDER` is now required. Set it to `pterodactyl` for Play Hosting or `aternos` for rollback. The old Aternos `SERVER_ID` variable was renamed to `ATERNOS_SERVER_ID`; v0.4 still accepts the legacy name when the new one is absent, but new configurations should use `ATERNOS_SERVER_ID`. Pterodactyl mode also requires a writable `ARTIFACT_DIR` for the FlareSolverr ownership marker, even when browser artifact capture is disabled. LaunchAgent logs remain under `artifacts/launchd`; rotate or truncate them using normal local log maintenance when needed.
 
 ## Safety And Privacy
 
 - Never commit `.env`.
-- Runtime artifacts may contain Discord metadata, local paths, screenshots, and authenticated page HTML.
+- Runtime artifacts may contain Discord metadata, local paths, screenshots, authenticated Aternos page HTML, or sanitized provider state.
 - Screenshots are kept available by default for operational diagnosis. Because `/server start` is public by design, enabled screenshot attachment may post authenticated dashboard screenshots to the Discord channel where the command is used.
 - HTML is more sensitive, so the default only captures HTML on failure.
 - Persisted JSONL events redact Discord names and IDs by default. Set `BUTLER_PERSIST_RUN_EVENTS=false` to disable persisted event logs.
