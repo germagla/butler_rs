@@ -12,6 +12,99 @@ STDERR_LOG="$LOG_DIR/stderr.log"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST="$PLIST_DIR/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
+TEMP_PLIST=""
+INSTALL_LOCK_HELD=false
+INSTALL_LOCK_OWNER=""
+RECLAIM_LOCK_HELD=false
+RECLAIM_LOCK_OWNER=""
+
+cleanup() {
+    if [ "$INSTALL_LOCK_HELD" = true ]; then
+        CURRENT_LOCK_OWNER=$(/bin/cat "$START_ADMISSION_LOCK" 2>/dev/null || true)
+        if [ "$CURRENT_LOCK_OWNER" = "$INSTALL_LOCK_OWNER" ]; then
+            /bin/rm -f "$START_ADMISSION_LOCK"
+        fi
+    fi
+    if [ "$RECLAIM_LOCK_HELD" = true ]; then
+        CURRENT_RECLAIM_OWNER=$(/bin/cat "$START_ADMISSION_RECLAIM_LOCK" 2>/dev/null || true)
+        if [ "$CURRENT_RECLAIM_OWNER" = "$RECLAIM_LOCK_OWNER" ]; then
+            /bin/rm -f "$START_ADMISSION_RECLAIM_LOCK"
+        fi
+    fi
+    if [ -n "$TEMP_PLIST" ]; then
+        /bin/rm -f "$TEMP_PLIST"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+acquire_start_admission_lock() {
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 2 ]; do
+        TEMP_LOCK=$(mktemp "$ARTIFACT_DIR/.start-admission.XXXXXX")
+        LOCK_TOKEN=${TEMP_LOCK##*/}
+        printf '%s\n%s\n' "$$" "$LOCK_TOKEN" > "$TEMP_LOCK"
+        chmod 600 "$TEMP_LOCK"
+        if /bin/ln "$TEMP_LOCK" "$START_ADMISSION_LOCK" 2>/dev/null; then
+            INSTALL_LOCK_OWNER=$(/bin/cat "$TEMP_LOCK")
+            /bin/rm -f "$TEMP_LOCK"
+            INSTALL_LOCK_HELD=true
+            if [ "$RECLAIM_LOCK_HELD" = true ]; then
+                CURRENT_RECLAIM_OWNER=$(/bin/cat "$START_ADMISSION_RECLAIM_LOCK" 2>/dev/null || true)
+                if [ "$CURRENT_RECLAIM_OWNER" = "$RECLAIM_LOCK_OWNER" ]; then
+                    /bin/rm -f "$START_ADMISSION_RECLAIM_LOCK"
+                fi
+                RECLAIM_LOCK_HELD=false
+            fi
+            return
+        fi
+        /bin/rm -f "$TEMP_LOCK"
+        if [ "$RECLAIM_LOCK_HELD" != true ]; then
+            TEMP_RECLAIM=$(mktemp "$ARTIFACT_DIR/.start-admission-reclaim.XXXXXX")
+            RECLAIM_TOKEN=${TEMP_RECLAIM##*/}
+            printf '%s\n%s\n' "$$" "$RECLAIM_TOKEN" > "$TEMP_RECLAIM"
+            chmod 600 "$TEMP_RECLAIM"
+            if ! /bin/ln "$TEMP_RECLAIM" "$START_ADMISSION_RECLAIM_LOCK" 2>/dev/null; then
+                /bin/rm -f "$TEMP_RECLAIM"
+                echo "Another process is inspecting a stale start-admission lock." >&2
+                exit 1
+            fi
+            RECLAIM_LOCK_OWNER=$(/bin/cat "$TEMP_RECLAIM")
+            /bin/rm -f "$TEMP_RECLAIM"
+            RECLAIM_LOCK_HELD=true
+        fi
+        if [ ! -e "$START_ADMISSION_LOCK" ]; then
+            ATTEMPT=$((ATTEMPT + 1))
+            continue
+        fi
+        if [ ! -f "$START_ADMISSION_LOCK" ] || [ -L "$START_ADMISSION_LOCK" ]; then
+            echo "Unsafe start-admission lock at $START_ADMISSION_LOCK." >&2
+            exit 1
+        fi
+        LOCK_OWNER=$(/bin/cat "$START_ADMISSION_LOCK" 2>/dev/null || true)
+        LOCK_PID=$(printf '%s\n' "$LOCK_OWNER" | /usr/bin/head -n 1)
+        case "$LOCK_PID" in
+            ''|*[!0-9]*)
+                echo "Start-admission lock has invalid ownership." >&2
+                exit 1
+                ;;
+        esac
+        if /bin/kill -0 "$LOCK_PID" 2>/dev/null; then
+            RUN_ID=$(/usr/bin/head -n 1 "$ACTIVE_START_MARKER" 2>/dev/null \
+                | /usr/bin/tr -cd 'A-Za-z0-9_-' || true)
+            echo "Butler start run ${RUN_ID:-unknown} is active; retry installation after it finishes." >&2
+            exit 1
+        fi
+        CURRENT_LOCK_OWNER=$(/bin/cat "$START_ADMISSION_LOCK" 2>/dev/null || true)
+        if [ "$CURRENT_LOCK_OWNER" != "$LOCK_OWNER" ]; then
+            echo "Start-admission lock ownership changed during inspection." >&2
+            exit 1
+        fi
+        /bin/rm -f "$START_ADMISSION_LOCK"
+        ATTEMPT=$((ATTEMPT + 1))
+    done
+    echo "Could not acquire start-admission lock." >&2
+    exit 1
+}
 
 if [ "$(uname -s)" != "Darwin" ]; then
     echo "This installer only supports macOS." >&2
@@ -48,13 +141,22 @@ echo "Checking Butler configuration..."
     cd "$ROOT_DIR"
     "$BINARY" --check-config
 )
+ARTIFACT_DIR=$(
+    cd "$ROOT_DIR"
+    "$BINARY" --print-artifact-dir
+)
+ACTIVE_START_MARKER="$ARTIFACT_DIR/.active-start"
+START_ADMISSION_LOCK="$ARTIFACT_DIR/.start-admission.lock"
+START_ADMISSION_RECLAIM_LOCK="$ARTIFACT_DIR/.start-admission.lock.reclaim"
+mkdir -p "$ARTIFACT_DIR"
+chmod 700 "$ARTIFACT_DIR"
+acquire_start_admission_lock
 
 mkdir -p "$LOG_DIR" "$PLIST_DIR"
 chmod 700 "$LOG_DIR"
 
 umask 077
 TEMP_PLIST=$(mktemp "${TMPDIR:-/tmp}/$LABEL.XXXXXX")
-trap 'rm -f "$TEMP_PLIST"' EXIT HUP INT TERM
 
 /usr/bin/plutil -create xml1 "$TEMP_PLIST"
 /usr/bin/plutil -insert Label -string "$LABEL" "$TEMP_PLIST"
@@ -64,7 +166,7 @@ trap 'rm -f "$TEMP_PLIST"' EXIT HUP INT TERM
 /usr/bin/plutil -insert RunAtLoad -bool true "$TEMP_PLIST"
 /usr/bin/plutil -insert KeepAlive -bool true "$TEMP_PLIST"
 /usr/bin/plutil -insert ThrottleInterval -integer 10 "$TEMP_PLIST"
-/usr/bin/plutil -insert ExitTimeOut -integer 450 "$TEMP_PLIST"
+/usr/bin/plutil -insert ExitTimeOut -integer 8100 "$TEMP_PLIST"
 /usr/bin/plutil -insert Umask -integer 63 "$TEMP_PLIST"
 /usr/bin/plutil -insert ProcessType -string Background "$TEMP_PLIST"
 /usr/bin/plutil -insert StandardOutPath -string "$STDOUT_LOG" "$TEMP_PLIST"
@@ -83,7 +185,7 @@ if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
     WAIT_COUNT=0
     while /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; do
         WAIT_COUNT=$((WAIT_COUNT + 1))
-        if [ "$WAIT_COUNT" -ge 1840 ]; then
+        if [ "$WAIT_COUNT" -ge 32440 ]; then
             echo "Existing Butler service did not finish unloading." >&2
             exit 1
         fi

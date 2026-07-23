@@ -1,8 +1,8 @@
 use crate::{
     config::{ArtifactCapture, AternosConfig},
     provider::{
-        ProviderStartFailure, ProviderStartFuture, ProviderStartResult, ServerStartProvider,
-        StartOutcome,
+        ProviderMutation, ProviderStartFailure, ProviderStartFuture, ProviderStartResult,
+        ServerStartProvider, StartOutcome,
     },
     run_history::{ensure_owner_only_file, mark_run_artifact_dir},
     terminal,
@@ -107,7 +107,8 @@ impl ServerStartProvider for BrowserAternosProvider {
                 screenshot_path: None,
                 detail_artifact_path: None,
                 minecraft_address: None,
-                start_may_have_been_submitted: false,
+                uncertain_mutation: ProviderMutation::None,
+                retryable: false,
             })?
         })
     }
@@ -181,7 +182,8 @@ fn run_browser_start_once(
         screenshot_path: None,
         detail_artifact_path: None,
         minecraft_address: None,
-        start_may_have_been_submitted: false,
+        uncertain_mutation: ProviderMutation::None,
+        retryable: false,
     })?;
     let tab = browser.new_tab().map_err(|error| ProviderStartFailure {
         error_class: browser_setup_error_class(&error.to_string(), "BrowserTab"),
@@ -189,7 +191,8 @@ fn run_browser_start_once(
         screenshot_path: None,
         detail_artifact_path: None,
         minecraft_address: None,
-        start_may_have_been_submitted: false,
+        uncertain_mutation: ProviderMutation::None,
+        retryable: false,
     })?;
 
     match run_dashboard_flow(
@@ -208,7 +211,8 @@ fn run_browser_start_once(
                 screenshot_path: None,
                 detail_artifact_path: None,
                 minecraft_address: None,
-                start_may_have_been_submitted: false,
+                uncertain_mutation: ProviderMutation::None,
+                retryable: false,
             };
             apply_post_click_submission_metadata(&mut failure, flow_failure.start_clicked);
             if !is_retryable_browser_failure(&failure) || capture_retryable_failure_artifacts {
@@ -227,7 +231,7 @@ fn run_browser_start_once(
             }
             failure.screenshot_path = failure_screenshot_or_checkpoint(
                 failure.screenshot_path,
-                failure.start_may_have_been_submitted,
+                failure.uncertain_mutation.may_have_started_server(),
                 flow_failure.checkpoint_screenshot_path,
             );
             Err(failure)
@@ -1523,7 +1527,7 @@ fn browser_setup_error_class(message: &str, fallback: &str) -> String {
 }
 
 fn is_retryable_browser_failure(failure: &ProviderStartFailure) -> bool {
-    if failure.start_may_have_been_submitted {
+    if failure.uncertain_mutation.may_have_started_server() {
         return false;
     }
     match failure.error_class.as_str() {
@@ -1546,7 +1550,7 @@ fn apply_post_click_submission_metadata(failure: &mut ProviderStartFailure, star
     if !start_clicked || !is_ambiguous_browser_failure(failure) {
         return;
     }
-    failure.start_may_have_been_submitted = true;
+    failure.uncertain_mutation = ProviderMutation::BrowserStart;
     if failure.error_class == "BrowserConnectionClosed" {
         failure.error_class = "BrowserConnectionClosedAfterStartClick".to_string();
     }
@@ -1972,7 +1976,8 @@ mod tests {
             screenshot_path: None,
             detail_artifact_path: None,
             minecraft_address: None,
-            start_may_have_been_submitted: false,
+            uncertain_mutation: ProviderMutation::None,
+            retryable: false,
         };
 
         assert!(is_retryable_browser_failure(&failure));
@@ -2125,7 +2130,7 @@ mod tests {
     fn post_click_ambiguous_failure_is_not_retryable() {
         let mut failure =
             provider_failure("BrowserEventTimeout", "The event waited for never came");
-        failure.start_may_have_been_submitted = true;
+        failure.uncertain_mutation = ProviderMutation::BrowserStart;
 
         assert!(!is_retryable_browser_failure(&failure));
     }
@@ -2135,7 +2140,10 @@ mod tests {
         let mut event_timeout =
             provider_failure("BrowserEventTimeout", "The event waited for never came");
         apply_post_click_submission_metadata(&mut event_timeout, true);
-        assert!(event_timeout.start_may_have_been_submitted);
+        assert_eq!(
+            event_timeout.uncertain_mutation,
+            ProviderMutation::BrowserStart
+        );
         assert_eq!(event_timeout.error_class, "BrowserEventTimeout");
         assert!(
             event_timeout
@@ -2148,7 +2156,10 @@ mod tests {
             "Unable to make method calls because underlying connection is closed",
         );
         apply_post_click_submission_metadata(&mut connection_closed, true);
-        assert!(connection_closed.start_may_have_been_submitted);
+        assert_eq!(
+            connection_closed.uncertain_mutation,
+            ProviderMutation::BrowserStart
+        );
         assert_eq!(
             connection_closed.error_class,
             "BrowserConnectionClosedAfterStartClick"
@@ -2215,7 +2226,8 @@ mod tests {
             screenshot_path: None,
             detail_artifact_path: None,
             minecraft_address: None,
-            start_may_have_been_submitted: false,
+            uncertain_mutation: ProviderMutation::None,
+            retryable: false,
         }
     }
 }

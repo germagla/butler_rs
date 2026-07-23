@@ -5,6 +5,12 @@ use anyhow::Result;
 use poise::serenity_prelude as serenity;
 use std::{path::Path, path::PathBuf};
 
+#[derive(Clone, Copy)]
+pub(super) struct StartMessage {
+    channel_id: serenity::ChannelId,
+    message_id: serenity::MessageId,
+}
+
 pub(super) fn start_progress_content(run_id: &str, notice: Option<&str>) -> String {
     with_notice(format!("Starting server...\nRun: `{run_id}`"), notice)
 }
@@ -34,7 +40,7 @@ pub(super) fn with_notice(content: String, notice: Option<&str>) -> String {
 
 pub(super) async fn edit_start_message(
     ctx: Context<'_>,
-    message: &poise::ReplyHandle<'_>,
+    message: &StartMessage,
     notice: Option<&str>,
     content: String,
     screenshot_path: Option<PathBuf>,
@@ -45,21 +51,62 @@ pub(super) async fn edit_start_message(
     {
         match serenity::CreateAttachment::path(&path).await {
             Ok(attachment) => {
-                let reply = poise::CreateReply::default()
+                let edit = serenity::EditMessage::new()
                     .content(content.clone())
-                    .attachment(attachment);
-                match message.edit(ctx, reply).await {
-                    Ok(()) => return Ok(()),
+                    .allowed_mentions(disabled_mentions())
+                    .attachments(serenity::EditAttachments::new().add(attachment));
+                match message
+                    .channel_id
+                    .edit_message(ctx.serenity_context(), message.message_id, edit)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
                     Err(error) => emit_attachment_warning(&path, &error.to_string()),
                 }
             }
             Err(error) => emit_attachment_warning(&path, &error.to_string()),
         }
     }
-    message
-        .edit(ctx, poise::CreateReply::default().content(content))
-        .await?;
+    if let Err(error) = message
+        .channel_id
+        .edit_message(
+            ctx.serenity_context(),
+            message.message_id,
+            serenity::EditMessage::new()
+                .content(content)
+                .allowed_mentions(disabled_mentions()),
+        )
+        .await
+    {
+        terminal::emit(terminal::line(
+            "WARN",
+            "discord.progress",
+            "",
+            "",
+            None,
+            format!(
+                "could not edit start progress message; error {}",
+                terminal::clean(&error.to_string())
+            ),
+        ));
+    }
     Ok(())
+}
+
+pub(super) async fn send_start_message(ctx: Context<'_>, content: String) -> Result<StartMessage> {
+    let message = ctx
+        .channel_id()
+        .send_message(
+            ctx.serenity_context(),
+            serenity::CreateMessage::new()
+                .content(content)
+                .allowed_mentions(disabled_mentions()),
+        )
+        .await?;
+    Ok(StartMessage {
+        channel_id: message.channel_id,
+        message_id: message.id,
+    })
 }
 
 pub(super) async fn send_with_optional_screenshot(
@@ -130,6 +177,14 @@ fn emit_attachment_warning(path: &Path, error: &str) {
             terminal::clean(error)
         ),
     ));
+}
+
+fn disabled_mentions() -> serenity::CreateAllowedMentions {
+    serenity::CreateAllowedMentions::new()
+        .all_users(false)
+        .all_roles(false)
+        .everyone(false)
+        .replied_user(false)
 }
 
 pub(super) fn format_run_detail(run: &RunSummary) -> String {

@@ -92,6 +92,14 @@ Install Butler as a per-user LaunchAgent so it starts after login and restarts i
 ./scripts/install-launch-agent.sh
 ```
 
+The installer and Butler share a start-admission lock under the configured `ARTIFACT_DIR`.
+The installer refuses to unload an already-running Butler process while a `/server start`
+provider operation is active, and Butler rejects new starts while installation owns the lock.
+Wait for an active run to finish, then run the installer again. A separate process lock prevents
+two Butler instances from running against the same artifact directory. The LaunchAgent requests
+up to 135 minutes for graceful shutdown, covering the maximum supported allocation and online
+waits plus provider cleanup, though macOS may enforce a shorter system shutdown budget.
+
 The installer builds the release binary, restricts `.env` to owner-only access, and runs the binary with the repository as its working directory. Re-run the installer after code changes to rebuild and restart the service.
 
 Validate `.env` without connecting to Discord or starting local runtime services:
@@ -131,6 +139,7 @@ Remove automatic startup without deleting logs or run artifacts:
 | `PTERODACTYL_SERVER_ID` | Pterodactyl server identifier. | Required for Pterodactyl |
 | `PTERODACTYL_API_TOKEN` | Pterodactyl client API token. | Required for Pterodactyl |
 | `PTERODACTYL_POWER_ENABLED` | Allow the provider to issue the start power action. | `false` |
+| `PTERODACTYL_ALLOCATION_WAIT_SECS` | Maximum wait for Play Hosting to allocate a sleeping server before reporting a safe-to-retry timeout. Valid range: 1-3600 seconds. | `1200` |
 | `FLARESOLVERR_URL` | Loopback-only FlareSolverr endpoint. | `http://127.0.0.1:8191/` |
 | `FLARESOLVERR_CONTAINER` | Existing isolated Docker container Butler supervises. | `flaresolverr` |
 | `ORBSTACK_BIN` | Optional OrbStack CLI override. | `/opt/homebrew/bin/orbctl` |
@@ -138,7 +147,7 @@ Remove automatic startup without deleting logs or run artifacts:
 | `ATERNOS_USER` / `ATERNOS_PASS` | Browser credentials. | Required for Aternos |
 | `ATERNOS_SERVER_ID` | Optional Aternos server selector. | Empty |
 | `HEADLESS` / `CHROME` | Aternos browser settings. | `true` / auto-detect |
-| `START_WAIT_ONLINE_SECS` | Max wait when `/server start wait_online:true` is used. | `600` |
+| `START_WAIT_ONLINE_SECS` | Max wait when `/server start wait_online:true` is used. Valid range: 1-3600 seconds. | `600` |
 | `RUN_HISTORY_LIMIT` | Completed runs retained in memory and newest artifact run directories retained locally. | `20` |
 | `ARTIFACT_DIR` | Local diagnostics directory. | `artifacts/runs` |
 | `ARTIFACT_CAPTURE` | Artifact capture policy: `screenshots`, `full`, `failure`, or `off`. | `screenshots` |
@@ -157,7 +166,9 @@ In Pterodactyl mode, Butler starts OrbStack when necessary, starts `flaresolverr
 
 The expected media-stack configuration keeps FlareSolverr behind its own Compose profile, uses restart policy `no`, pins the image by digest, binds host port `8191` only to `127.0.0.1`, and preserves the internal `http://flaresolverr:8191/` endpoint for Prowlarr. Butler validates these properties before starting the configured container and restarts it after a bounded readiness failure. Docker and OrbStack child processes receive a minimal environment without Butler or provider secrets. The API token is sent only by Butler to the exact configured HTTPS panel origin; FlareSolverr receives no API credentials.
 
-For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It waits for an active allocation, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag. Each mutating request is issued at most once; ambiguous wake responses are checked through the read-only sleep-status endpoint, ambiguous power responses are checked through Pterodactyl resources, and Minecraft status remains the service-level fallback.
+For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It waits up to `PTERODACTYL_ALLOCATION_WAIT_SECS` for an active allocation, reports queue phase/position/estimate changes in an ordinary bot message that remains editable during long waits, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag.
+
+Wake/allocation and power-start uncertainty are tracked separately. A delayed allocation never triggers Minecraft submission verification because the power request has not happened yet. Each mutating request is issued at most once per command; ambiguous wake responses are checked through the read-only sleep-status endpoint, ambiguous power responses are checked through Pterodactyl resources, and only ambiguous power or browser-start submissions use Minecraft status as the service-level fallback. If the allocation deadline expires, running `/server start` again is safe: Butler inspects the current sleep status first and skips wake when the allocation is already `queued`, `waking`, or `active`.
 
 Cloudflare clearance is kept in memory and requested from FlareSolverr with a 180-second challenge budget. A transient FlareSolverr availability failure is retried once before any provider mutation.
 
@@ -180,7 +191,7 @@ When artifact capture or run-event persistence is enabled, Butler verifies on st
 
 Butler creates artifact directories with owner-only permissions (`0700`) and artifact/event files with owner-only permissions (`0600`) on Unix. Startup also repairs permissions on recognized existing Butler run directories and `events*.jsonl` files without touching unknown directories or symlinks.
 
-Pterodactyl runs write a sanitized `provider_state.json` containing only provider state, suspension status, and limbo status. They do not produce authenticated dashboard screenshots because FlareSolverr is used only to obtain Cloudflare clearance; the API token is never injected into a browser session.
+Pterodactyl runs write a sanitized `provider_state.json` containing the current workflow stage, provider power state, suspension/limbo flags, the latest allocation phase/queue/connection fields, mutation flags, and the last transient error when applicable. They do not produce authenticated dashboard screenshots because FlareSolverr is used only to obtain Cloudflare clearance; the API token and Cloudflare cookies are never written to this artifact or injected into a browser session.
 
 ## Docker
 

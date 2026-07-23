@@ -1,7 +1,7 @@
 use super::{
     responses::{
-        edit_start_message, format_failure_detail, format_provider_detail, start_final_content,
-        start_progress_content, with_notice,
+        StartMessage, edit_start_message, format_failure_detail, format_provider_detail,
+        send_start_message, start_final_content, start_progress_content, with_notice,
     },
     tracking::{RunTracker, run_context},
     types::StartOptions,
@@ -9,14 +9,17 @@ use super::{
 use crate::{
     framework::Context,
     minecraft::{self, ServerStatus},
-    provider::{ProviderStartFailure, ProviderStartResult, StartOutcome},
+    provider::{
+        ProviderProgress, ProviderProgressStage, ProviderStartFailure, ProviderStartResult,
+        StartOutcome,
+    },
     run_history::now_ms,
     state::{ActiveStartLease, ActiveStartRun, StartAdmissionError},
     terminal,
 };
 use anyhow::Result;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::{sync::mpsc, time::sleep};
 
 const POST_CLICK_VERIFY_SECS: u64 = 60;
 const MINECRAFT_STATUS_POLL_SECS: u64 = 5;
@@ -73,6 +76,14 @@ pub async fn start_server_with_notice(
             .await?;
             return Ok(());
         }
+        Err(StartAdmissionError::Unavailable) => {
+            ctx.say(with_notice(
+                "A start operation cannot be admitted right now; try again shortly.".to_string(),
+                notice,
+            ))
+            .await?;
+            return Ok(());
+        }
     };
 
     let mut tracker = RunTracker::new(ctx, context.clone());
@@ -92,18 +103,27 @@ pub async fn start_server_with_notice(
         start_details.join(" "),
     ));
 
-    let progress_message = match ctx
-        .send(
-            poise::CreateReply::default().content(start_progress_content(&context.run_id, notice)),
-        )
+    if let Err(error) = ctx
+        .send(poise::CreateReply::default().content(with_notice(
+            format!(
+                "Preparing the start operation. Progress will be posted in a bot message.\nRun: `{}`",
+                context.run_id
+            ),
+            notice,
+        )))
         .await
     {
-        Ok(message) => message,
-        Err(error) => {
-            active_lease.finish().await;
-            return Err(error.into());
-        }
-    };
+        active_lease.finish().await;
+        return Err(error.into());
+    }
+    let progress_message =
+        match send_start_message(ctx, start_progress_content(&context.run_id, notice)).await {
+            Ok(message) => message,
+            Err(error) => {
+                active_lease.finish().await;
+                return Err(error);
+            }
+        };
 
     let result = start_server_inner(
         ctx,
@@ -216,7 +236,7 @@ async fn start_server_inner(
     ctx: Context<'_>,
     options: StartOptions,
     tracker: &mut RunTracker<'_>,
-    progress_message: &poise::ReplyHandle<'_>,
+    progress_message: &StartMessage,
     notice: Option<&str>,
     active_lease: &ActiveStartLease,
 ) -> Result<()> {
@@ -291,8 +311,9 @@ async fn start_server_inner(
     let state = ctx.data().clone();
     let run_id = tracker.context.run_id.clone();
     let operation_guard = active_lease.operation_guard();
-    let provider_result = tokio::spawn(async move {
-        let result = provider.start(&run_id).await;
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let mut provider_task = tokio::spawn(async move {
+        let result = provider.start_with_progress(&run_id, progress_tx).await;
         let provider_address = match &result {
             Ok(result) => result.minecraft_address.as_ref(),
             Err(failure) => failure.minecraft_address.as_ref(),
@@ -302,9 +323,25 @@ async fn start_server_inner(
         }
         drop(operation_guard);
         result
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("provider operation task failed: {error}"))?;
+    });
+    let provider_result = loop {
+        tokio::select! {
+            result = &mut provider_task => {
+                break result
+                    .map_err(|error| anyhow::anyhow!("provider operation task failed: {error}"))?;
+            }
+            Some(progress) = progress_rx.recv() => {
+                handle_provider_progress(
+                    ctx,
+                    tracker,
+                    progress,
+                    progress_message,
+                    notice,
+                )
+                .await;
+            }
+        }
+    };
 
     match provider_result {
         Ok(provider_result) => {
@@ -336,13 +373,83 @@ async fn start_server_inner(
     Ok(())
 }
 
+async fn handle_provider_progress(
+    ctx: Context<'_>,
+    tracker: &mut RunTracker<'_>,
+    progress: ProviderProgress,
+    progress_message: &StartMessage,
+    notice: Option<&str>,
+) {
+    let stage = progress.stage.to_string();
+    tracker
+        .step(
+            "provider_progress",
+            &stage,
+            Some(progress.detail.clone()),
+            None,
+            None,
+        )
+        .await;
+    terminal::emit(terminal::line_for_context(
+        "WAIT",
+        &tracker.context,
+        format!(
+            "{} {} {}",
+            tracker.context.run_id,
+            stage,
+            terminal::clean(&progress.detail)
+        ),
+    ));
+    if let Err(error) = edit_start_message(
+        ctx,
+        progress_message,
+        notice,
+        provider_progress_content(&tracker.context.run_id, &progress),
+        None,
+    )
+    .await
+    {
+        terminal::emit(terminal::line_for_context(
+            "WARN",
+            &tracker.context,
+            format!(
+                "{} could not update provider progress; error {}",
+                tracker.context.run_id,
+                terminal::clean(&error.to_string())
+            ),
+        ));
+    }
+}
+
+fn provider_progress_content(run_id: &str, progress: &ProviderProgress) -> String {
+    let headline = match progress.stage {
+        ProviderProgressStage::SolvingChallenge => "Preparing provider access.",
+        ProviderProgressStage::RequestingAllocation => "Requesting host allocation.",
+        ProviderProgressStage::WaitingForAllocation => "Waiting for host allocation.",
+        ProviderProgressStage::RequestingPower => "Host allocated; requesting server power.",
+    };
+    format!(
+        "{headline}\n{}\nRun: `{run_id}`",
+        discord_safe_provider_detail(&progress.detail)
+    )
+}
+
+fn discord_safe_provider_detail(detail: &str) -> String {
+    terminal::clean(detail)
+        .replace('@', "@\u{200b}")
+        .replace('`', "'")
+        .chars()
+        .take(500)
+        .collect()
+}
+
 async fn handle_provider_success(
     ctx: Context<'_>,
     tracker: &mut RunTracker<'_>,
     provider_result: ProviderStartResult,
     preflight_status: Option<String>,
     options: StartOptions,
-    progress_message: &poise::ReplyHandle<'_>,
+    progress_message: &StartMessage,
     notice: Option<&str>,
 ) -> Result<()> {
     let screenshot_path = provider_result.screenshot_path.clone();
@@ -573,10 +680,10 @@ async fn handle_provider_failure(
     failure: ProviderStartFailure,
     preflight_status: Option<String>,
     options: StartOptions,
-    progress_message: &poise::ReplyHandle<'_>,
+    progress_message: &StartMessage,
     notice: Option<&str>,
 ) -> Result<()> {
-    if failure.start_may_have_been_submitted {
+    if failure.uncertain_mutation.may_have_started_server() {
         return handle_unconfirmed_submitted_start(
             ctx,
             tracker,
@@ -627,7 +734,7 @@ async fn handle_unconfirmed_submitted_start(
     failure: ProviderStartFailure,
     preflight_status: Option<String>,
     options: StartOptions,
-    progress_message: &poise::ReplyHandle<'_>,
+    progress_message: &StartMessage,
     notice: Option<&str>,
 ) -> Result<()> {
     let screenshot_path = failure.screenshot_path.clone();
@@ -734,6 +841,11 @@ async fn handle_unconfirmed_submitted_start(
 }
 
 fn provider_failure_public_content(error_class: &str, run_id: &str) -> String {
+    if error_class == "ProviderAllocationTimeout" {
+        return format!(
+            "Host allocation did not finish before the timeout. Running `/server start` again is safe; Butler will inspect the current provider state before acting.\nRun: `{run_id}`"
+        );
+    }
     format!("Start failed: **{error_class}**\nRun: `{run_id}`")
 }
 
@@ -805,6 +917,43 @@ mod tests {
         assert!(!content.contains("An owner or server Administrator"));
         assert!(!content.contains("/bot run"));
         assert_eq!(content, "Start failed: **StartNotAccepted**\nRun: `abc123`");
+    }
+
+    #[test]
+    fn allocation_timeout_content_explains_safe_retry() {
+        let content = provider_failure_public_content("ProviderAllocationTimeout", "abc123");
+        assert!(content.contains("did not finish"));
+        assert!(content.contains("again is safe"));
+        assert!(content.contains("abc123"));
+        assert!(!content.contains("Start may have been submitted"));
+    }
+
+    #[test]
+    fn provider_progress_content_reports_allocation_state() {
+        let content = provider_progress_content(
+            "abc123",
+            &ProviderProgress {
+                stage: ProviderProgressStage::WaitingForAllocation,
+                detail: "phase waking, queue 1/4, estimated 3 minutes".to_string(),
+            },
+        );
+        assert!(content.contains("Waiting for host allocation"));
+        assert!(content.contains("queue 1/4"));
+        assert!(content.contains("abc123"));
+    }
+
+    #[test]
+    fn provider_progress_content_suppresses_mentions_and_bounds_text() {
+        let content = provider_progress_content(
+            "abc123",
+            &ProviderProgress {
+                stage: ProviderProgressStage::WaitingForAllocation,
+                detail: format!("@everyone `{}`", "x".repeat(1_000)),
+            },
+        );
+        assert!(!content.contains("@everyone"));
+        assert!(!content.contains('`') || content.contains("`abc123`"));
+        assert!(content.chars().count() < 650);
     }
 
     #[test]

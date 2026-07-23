@@ -1,4 +1,5 @@
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartOutcome {
@@ -35,8 +36,52 @@ pub struct ProviderStartFailure {
     pub screenshot_path: Option<PathBuf>,
     pub detail_artifact_path: Option<PathBuf>,
     pub minecraft_address: Option<Arc<str>>,
-    pub start_may_have_been_submitted: bool,
+    pub uncertain_mutation: ProviderMutation,
+    pub retryable: bool,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderMutation {
+    #[default]
+    None,
+    WakeAllocation,
+    PowerStart,
+    BrowserStart,
+}
+
+impl ProviderMutation {
+    pub fn may_have_started_server(self) -> bool {
+        matches!(self, Self::PowerStart | Self::BrowserStart)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderProgress {
+    pub stage: ProviderProgressStage,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderProgressStage {
+    SolvingChallenge,
+    RequestingAllocation,
+    WaitingForAllocation,
+    RequestingPower,
+}
+
+impl std::fmt::Display for ProviderProgressStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::SolvingChallenge => "SolvingChallenge",
+            Self::RequestingAllocation => "RequestingAllocation",
+            Self::WaitingForAllocation => "WaitingForAllocation",
+            Self::RequestingPower => "RequestingPower",
+        };
+        write!(f, "{value}")
+    }
+}
+
+pub type ProviderProgressSender = mpsc::UnboundedSender<ProviderProgress>;
 
 impl std::fmt::Display for ProviderStartFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,6 +97,14 @@ pub type ProviderStartFuture<'a> =
 pub trait ServerStartProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn start<'a>(&'a self, run_id: &'a str) -> ProviderStartFuture<'a>;
+
+    fn start_with_progress<'a>(
+        &'a self,
+        run_id: &'a str,
+        _progress: ProviderProgressSender,
+    ) -> ProviderStartFuture<'a> {
+        self.start(run_id)
+    }
 }
 
 #[cfg(test)]
@@ -101,7 +154,8 @@ mod tests {
                 screenshot_path: None,
                 detail_artifact_path: None,
                 minecraft_address: None,
-                start_may_have_been_submitted: false,
+                uncertain_mutation: ProviderMutation::None,
+                retryable: false,
             }),
         };
 
@@ -109,5 +163,13 @@ mod tests {
 
         assert_eq!(failure.error_class, "StartNotAccepted");
         assert_eq!(failure.to_string(), "StartNotAccepted: still offline");
+    }
+
+    #[test]
+    fn only_start_mutations_trigger_minecraft_verification() {
+        assert!(!ProviderMutation::None.may_have_started_server());
+        assert!(!ProviderMutation::WakeAllocation.may_have_started_server());
+        assert!(ProviderMutation::PowerStart.may_have_started_server());
+        assert!(ProviderMutation::BrowserStart.may_have_started_server());
     }
 }

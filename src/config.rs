@@ -70,6 +70,7 @@ pub struct PterodactylConfig {
     pub server_id: String,
     pub api_token: String,
     pub power_enabled: bool,
+    pub allocation_wait_secs: u64,
     pub flaresolverr_url: Url,
     pub flaresolverr_container: String,
     pub orbctl_path: PathBuf,
@@ -79,7 +80,7 @@ pub struct PterodactylConfig {
 #[derive(Clone)]
 pub enum ProviderConfig {
     Aternos(AternosConfig),
-    Pterodactyl(PterodactylConfig),
+    Pterodactyl(Box<PterodactylConfig>),
 }
 
 #[derive(Clone)]
@@ -110,22 +111,29 @@ impl Config {
                 headless: bool_var("HEADLESS", true)?,
                 chrome_path: optional_nonempty_var("CHROME").map(PathBuf::from),
             }),
-            ServerProviderKind::Pterodactyl => ProviderConfig::Pterodactyl(PterodactylConfig {
-                panel_origin: panel_origin_var("PTERODACTYL_PANEL_URL")?,
-                server_id: pterodactyl_server_id_var("PTERODACTYL_SERVER_ID")?,
-                api_token: required_nonempty_var("PTERODACTYL_API_TOKEN")?,
-                power_enabled: bool_var("PTERODACTYL_POWER_ENABLED", false)?,
-                flaresolverr_url: flaresolverr_url_var("FLARESOLVERR_URL")?,
-                flaresolverr_container: container_name_var("FLARESOLVERR_CONTAINER")?,
-                orbctl_path: PathBuf::from(
-                    optional_nonempty_var("ORBSTACK_BIN")
-                        .unwrap_or_else(|| "/opt/homebrew/bin/orbctl".to_string()),
-                ),
-                docker_path: PathBuf::from(
-                    optional_nonempty_var("DOCKER_BIN")
-                        .unwrap_or_else(|| "/usr/local/bin/docker".to_string()),
-                ),
-            }),
+            ServerProviderKind::Pterodactyl => {
+                ProviderConfig::Pterodactyl(Box::new(PterodactylConfig {
+                    panel_origin: panel_origin_var("PTERODACTYL_PANEL_URL")?,
+                    server_id: pterodactyl_server_id_var("PTERODACTYL_SERVER_ID")?,
+                    api_token: required_nonempty_var("PTERODACTYL_API_TOKEN")?,
+                    power_enabled: bool_var("PTERODACTYL_POWER_ENABLED", false)?,
+                    allocation_wait_secs: bounded_positive_u64_var(
+                        "PTERODACTYL_ALLOCATION_WAIT_SECS",
+                        1_200,
+                        3_600,
+                    )?,
+                    flaresolverr_url: flaresolverr_url_var("FLARESOLVERR_URL")?,
+                    flaresolverr_container: container_name_var("FLARESOLVERR_CONTAINER")?,
+                    orbctl_path: PathBuf::from(
+                        optional_nonempty_var("ORBSTACK_BIN")
+                            .unwrap_or_else(|| "/opt/homebrew/bin/orbctl".to_string()),
+                    ),
+                    docker_path: PathBuf::from(
+                        optional_nonempty_var("DOCKER_BIN")
+                            .unwrap_or_else(|| "/usr/local/bin/docker".to_string()),
+                    ),
+                }))
+            }
         };
         let minecraft_server_addr =
             env::var("MINECRAFT_SERVER_ADDR").unwrap_or_else(|_| "localhost:25565".to_string());
@@ -135,7 +143,7 @@ impl Config {
             discord_token,
             provider,
             minecraft_server_addr,
-            start_wait_online_secs: u64_var("START_WAIT_ONLINE_SECS", 600)?,
+            start_wait_online_secs: bounded_positive_u64_var("START_WAIT_ONLINE_SECS", 600, 3_600)?,
             run_history_limit: usize_var("RUN_HISTORY_LIMIT", 20)?,
             artifact_dir: PathBuf::from(
                 env::var("ARTIFACT_DIR").unwrap_or_else(|_| "artifacts/runs".to_string()),
@@ -162,6 +170,23 @@ fn required_nonempty_var(name: &str) -> Result<String> {
         bail!("{name} must not be empty");
     }
     Ok(value.trim().to_string())
+}
+
+fn bounded_positive_u64_var(name: &str, default: u64, maximum: u64) -> Result<u64> {
+    bounded_positive_u64_var_value(env::var(name).ok().as_deref(), default, maximum).with_context(
+        || format!("{name} must be a positive unsigned integer no greater than {maximum}"),
+    )
+}
+
+fn bounded_positive_u64_var_value(value: Option<&str>, default: u64, maximum: u64) -> Result<u64> {
+    let value = u64_var_value(value, default)?;
+    if value == 0 {
+        bail!("value must be greater than zero");
+    }
+    if value > maximum {
+        bail!("value must not exceed {maximum}");
+    }
+    Ok(value)
 }
 
 fn optional_nonempty_var(name: &str) -> Option<String> {
@@ -282,11 +307,6 @@ fn parse_bool_value(value: Option<&str>, default: bool) -> Result<bool> {
         "0" | "false" | "no" | "n" | "off" => Ok(false),
         other => bail!("invalid boolean value `{other}`"),
     }
-}
-
-fn u64_var(name: &str, default: u64) -> Result<u64> {
-    u64_var_value(env::var(name).ok().as_deref(), default)
-        .with_context(|| format!("{name} must be an unsigned integer"))
 }
 
 fn usize_var(name: &str, default: usize) -> Result<usize> {
@@ -418,6 +438,17 @@ mod tests {
         assert_eq!(usize_var_value(Some("3"), 20).unwrap(), 3);
         assert_eq!(usize_var_value(None, 20).unwrap(), 20);
         assert!(usize_var_value(Some("many"), 20).is_err());
+        assert_eq!(
+            bounded_positive_u64_var_value(None, 1_200, 3_600).unwrap(),
+            1_200
+        );
+        assert_eq!(
+            bounded_positive_u64_var_value(Some("900"), 1_200, 3_600).unwrap(),
+            900
+        );
+        assert!(bounded_positive_u64_var_value(Some("0"), 1_200, 3_600).is_err());
+        assert!(bounded_positive_u64_var_value(Some("3601"), 1_200, 3_600).is_err());
+        assert!(bounded_positive_u64_var_value(Some("never"), 1_200, 3_600).is_err());
     }
 
     #[test]

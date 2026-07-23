@@ -119,6 +119,7 @@ dependencies = [
  "craftping",
  "dotenvy",
  "headless_chrome",
+ "libc",
  "poise",
  "rand 0.8.5",
  "regex",

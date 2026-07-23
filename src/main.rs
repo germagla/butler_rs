@@ -38,6 +38,18 @@ async fn main() -> anyhow::Result<()> {
             println!("Butler configuration is valid.");
             return Ok(());
         }
+        Some(argument) if argument == "--print-artifact-dir" => {
+            if args.next().is_some() {
+                anyhow::bail!("--print-artifact-dir does not accept additional arguments");
+            }
+            let artifact_dir = if config.artifact_dir.is_absolute() {
+                config.artifact_dir.clone()
+            } else {
+                std::env::current_dir()?.join(&config.artifact_dir)
+            };
+            println!("{}", artifact_dir.display());
+            return Ok(());
+        }
         Some(argument) => anyhow::bail!("unknown argument `{argument}`"),
         None => {}
     }
@@ -51,12 +63,21 @@ async fn main() -> anyhow::Result<()> {
         }
         config::ProviderConfig::Pterodactyl(provider_config) => {
             Arc::new(pterodactyl::PterodactylProvider::new(
-                provider_config.clone(),
+                provider_config.as_ref().clone(),
                 config.artifact_dir.clone(),
                 config.artifact_capture,
             )?)
         }
     };
+    let provider_shutdown_wait_secs = match &config.provider {
+        config::ProviderConfig::Pterodactyl(provider_config) => {
+            provider_config.allocation_wait_secs
+        }
+        config::ProviderConfig::Aternos(_) => 0,
+    }
+    .saturating_add(config.start_wait_online_secs)
+    .saturating_add(420);
+    let provider_shutdown_wait = Duration::from_secs(provider_shutdown_wait_secs);
     let state = state::BotState::new(config.clone(), provider)?;
     let shutdown_state = state.clone();
     let framework = framework::create_framework(state);
@@ -105,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
 
     shutdown_state.begin_shutdown().await;
     if !shutdown_state
-        .wait_for_provider_operations(Duration::from_secs(420))
+        .wait_for_provider_operations(provider_shutdown_wait)
         .await
     {
         terminal::emit(terminal::line(
