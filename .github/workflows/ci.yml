@@ -49,3 +49,13 @@ jobs:
 
       - name: Docker build
         run: docker build -t butler_rs:ci .
+
+      - name: Docker runtime smoke test
+        run: |
+          docker run --rm \
+            -e DISCORD_TOKEN=test \
+            -e SERVER_PROVIDER=pterodactyl \
+            -e PTERODACTYL_PANEL_URL=https://example.com \
+            -e PTERODACTYL_SERVER_ID=deadbeef \
+            -e PTERODACTYL_API_TOKEN=test \
+            butler_rs:ci butler_rs --check-config
