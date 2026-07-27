@@ -10,18 +10,22 @@ use crate::{
     framework::Context,
     minecraft::{self, ServerStatus},
     provider::{
-        ProviderProgress, ProviderProgressStage, ProviderStartFailure, ProviderStartResult,
-        StartOutcome,
+        ProviderMutation, ProviderProgress, ProviderProgressStage, ProviderStartFailure,
+        ProviderStartResult, StartOutcome, SubmissionVerificationSource,
     },
     run_history::now_ms,
-    state::{ActiveStartLease, ActiveStartRun, StartAdmissionError},
+    state::{ActiveStartLease, ActiveStartOperationGuard, ActiveStartRun, StartAdmissionError},
     terminal,
 };
 use anyhow::Result;
 use std::time::Duration;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, sleep, timeout},
+};
 
 const POST_CLICK_VERIFY_SECS: u64 = 60;
+const PROVIDER_VERIFY_SLICE_SECS: u64 = 20;
 const MINECRAFT_STATUS_POLL_SECS: u64 = 5;
 const UNCONFIRMED_PROVIDER_STATUS: &str = "Unconfirmed (provider confirmation lost)";
 
@@ -321,10 +325,14 @@ async fn start_server_inner(
         if let Some(address) = provider_address {
             state.set_minecraft_address(address.to_string()).await;
         }
-        drop(operation_guard);
-        result
+        let safety_guard = retain_operation_guard_for_uncertain_result(
+            &result,
+            operation_guard,
+            Duration::from_secs(POST_CLICK_VERIFY_SECS),
+        );
+        (result, safety_guard)
     });
-    let provider_result = loop {
+    let (provider_result, provider_safety_guard) = loop {
         tokio::select! {
             result = &mut provider_task => {
                 break result
@@ -363,11 +371,15 @@ async fn start_server_inner(
                 failure,
                 preflight_status,
                 options,
-                progress_message,
-                notice,
+                (progress_message, notice),
+                active_lease,
             )
             .await?;
         }
+    }
+    if let Some(task) = provider_safety_guard {
+        task.abort();
+        let _ = task.await;
     }
 
     Ok(())
@@ -427,6 +439,9 @@ fn provider_progress_content(run_id: &str, progress: &ProviderProgress) -> Strin
         ProviderProgressStage::RequestingAllocation => "Requesting host allocation.",
         ProviderProgressStage::WaitingForAllocation => "Waiting for host allocation.",
         ProviderProgressStage::RequestingPower => "Host allocated; requesting server power.",
+        ProviderProgressStage::VerifyingPower => {
+            "Power response was interrupted; checking provider state."
+        }
     };
     format!(
         "{headline}\n{}\nRun: `{run_id}`",
@@ -608,21 +623,106 @@ async fn wait_for_minecraft_online(
 }
 
 struct SubmissionVerificationResult {
-    confirmed_status: Option<ServerStatus>,
+    confirmation: Option<SubmissionConfirmation>,
     final_minecraft_status: Option<String>,
+}
+
+enum SubmissionConfirmation {
+    Minecraft(ServerStatus),
+    Provider(String),
 }
 
 async fn verify_submitted_start(
     ctx: Context<'_>,
     tracker: &mut RunTracker<'_>,
+    mutation: ProviderMutation,
 ) -> SubmissionVerificationResult {
     let mut final_minecraft_status = None;
-    let deadline = now_ms().saturating_add((POST_CLICK_VERIFY_SECS as u128) * 1000);
+    let deadline = Instant::now() + Duration::from_secs(POST_CLICK_VERIFY_SECS);
 
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracker
+                .step(
+                    "minecraft_post_click_verify",
+                    "timeout",
+                    Some("Timed out verifying whether the start was submitted".to_string()),
+                    None,
+                    Some("StartSubmissionUnverified".to_string()),
+                )
+                .await;
+            return SubmissionVerificationResult {
+                confirmation: None,
+                final_minecraft_status,
+            };
+        }
+
+        if mutation == ProviderMutation::PowerStart {
+            match timeout(
+                std::cmp::min(remaining, Duration::from_secs(PROVIDER_VERIFY_SLICE_SECS)),
+                ctx.data().provider.check(&tracker.context.run_id),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    let confirmed =
+                        provider_status_confirms_start_submission(&result.provider_status);
+                    tracker
+                        .step(
+                            "provider_post_submit_verify",
+                            if confirmed { "accepted" } else { "waiting" },
+                            Some(result.provider_status.clone()),
+                            None,
+                            None,
+                        )
+                        .await;
+                    if confirmed {
+                        return SubmissionVerificationResult {
+                            confirmation: Some(SubmissionConfirmation::Provider(
+                                result.provider_status,
+                            )),
+                            final_minecraft_status,
+                        };
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracker
+                        .step(
+                            "provider_post_submit_verify",
+                            "warning",
+                            Some(format_failure_detail(&error)),
+                            None,
+                            Some(error.error_class),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    tracker
+                        .step(
+                            "provider_post_submit_verify",
+                            "warning",
+                            Some("Provider verification probe timed out".to_string()),
+                            None,
+                            Some("ProviderVerificationTimeout".to_string()),
+                        )
+                        .await;
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
         let minecraft_address = ctx.data().minecraft_address().await;
-        match minecraft::get_status_for_addr(&minecraft_address).await {
-            Ok(status) => {
+        match timeout(
+            remaining,
+            minecraft::get_status_for_addr(&minecraft_address),
+        )
+        .await
+        {
+            Ok(Ok(status)) => {
                 let status_text = status.to_string();
                 let confirmed = status_confirms_start_submission(&status);
                 final_minecraft_status = Some(status_text.clone());
@@ -637,12 +737,12 @@ async fn verify_submitted_start(
                     .await;
                 if confirmed {
                     return SubmissionVerificationResult {
-                        confirmed_status: Some(status),
+                        confirmation: Some(SubmissionConfirmation::Minecraft(status)),
                         final_minecraft_status,
                     };
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracker
                     .step(
                         "minecraft_post_click_verify",
@@ -653,24 +753,15 @@ async fn verify_submitted_start(
                     )
                     .await;
             }
+            Err(_) => continue,
         }
 
-        if now_ms() >= deadline {
-            tracker
-                .step(
-                    "minecraft_post_click_verify",
-                    "timeout",
-                    Some("Timed out verifying whether the start was submitted".to_string()),
-                    None,
-                    Some("StartSubmissionUnverified".to_string()),
-                )
-                .await;
-            return SubmissionVerificationResult {
-                confirmed_status: None,
-                final_minecraft_status,
-            };
-        }
-        sleep(Duration::from_secs(MINECRAFT_STATUS_POLL_SECS)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        sleep(std::cmp::min(
+            Duration::from_secs(MINECRAFT_STATUS_POLL_SECS),
+            remaining,
+        ))
+        .await;
     }
 }
 
@@ -680,9 +771,10 @@ async fn handle_provider_failure(
     failure: ProviderStartFailure,
     preflight_status: Option<String>,
     options: StartOptions,
-    progress_message: &StartMessage,
-    notice: Option<&str>,
+    response_target: (&StartMessage, Option<&str>),
+    active_lease: &ActiveStartLease,
 ) -> Result<()> {
+    let (progress_message, notice) = response_target;
     if failure.uncertain_mutation.may_have_started_server() {
         return handle_unconfirmed_submitted_start(
             ctx,
@@ -690,8 +782,8 @@ async fn handle_provider_failure(
             failure,
             preflight_status,
             options,
-            progress_message,
-            notice,
+            response_target,
+            active_lease,
         )
         .await;
     }
@@ -734,10 +826,12 @@ async fn handle_unconfirmed_submitted_start(
     failure: ProviderStartFailure,
     preflight_status: Option<String>,
     options: StartOptions,
-    progress_message: &StartMessage,
-    notice: Option<&str>,
+    response_target: (&StartMessage, Option<&str>),
+    active_lease: &ActiveStartLease,
 ) -> Result<()> {
-    let screenshot_path = failure.screenshot_path.clone();
+    let (progress_message, notice) = response_target;
+    let pre_verification_guard = spawn_submission_verification_guard(active_lease);
+    let mut screenshot_path = failure.screenshot_path.clone();
     tracker
         .step(
             "provider_start",
@@ -748,19 +842,83 @@ async fn handle_unconfirmed_submitted_start(
         )
         .await;
 
-    edit_start_message(
-        ctx,
-        progress_message,
-        notice,
-        start_submission_checking_content(&tracker.context.run_id),
-        screenshot_path.clone(),
+    let checking_edit = timeout(
+        Duration::from_secs(PROVIDER_VERIFY_SLICE_SECS),
+        edit_start_message(
+            ctx,
+            progress_message,
+            notice,
+            start_submission_checking_content(&tracker.context.run_id, failure.uncertain_mutation),
+            screenshot_path.clone(),
+        ),
     )
-    .await?;
+    .await;
+    if !matches!(checking_edit, Ok(Ok(()))) {
+        let detail = match checking_edit {
+            Ok(Err(error)) => format!("Could not update verification message ({error})"),
+            Err(_) => "Timed out updating verification message".to_string(),
+            Ok(Ok(())) => unreachable!(),
+        };
+        terminal::emit(terminal::line_for_context(
+            "WARN",
+            &tracker.context,
+            format!(
+                "{} {}; continuing verification",
+                tracker.context.run_id,
+                terminal::clean(&detail)
+            ),
+        ));
+        tracker
+            .step(
+                "submission_verification_message",
+                "warning",
+                Some(detail),
+                None,
+                None,
+            )
+            .await;
+    }
 
-    let verification = verify_submitted_start(ctx, tracker).await;
-    if let Some(status) = verification.confirmed_status {
-        let mut final_minecraft_status = Some(status.to_string());
-        let mut outcome = "StartSubmittedUnconfirmed".to_string();
+    let verification_guard = spawn_submission_verification_guard(active_lease);
+    pre_verification_guard.abort();
+    let _ = pre_verification_guard.await;
+    let verification = verify_submitted_start(ctx, tracker, failure.uncertain_mutation).await;
+    verification_guard.abort();
+    let _ = verification_guard.await;
+    if let Some(confirmation) = verification.confirmation {
+        let verification_source = match &confirmation {
+            SubmissionConfirmation::Provider(_) => SubmissionVerificationSource::Provider,
+            SubmissionConfirmation::Minecraft(_) => SubmissionVerificationSource::Minecraft,
+        };
+        let observed_state = match &confirmation {
+            SubmissionConfirmation::Provider(status) => status.as_str(),
+            SubmissionConfirmation::Minecraft(_) => "online",
+        };
+        if let Some(verified_screenshot) = ctx
+            .data()
+            .provider
+            .submission_verified_artifact(
+                &tracker.context.run_id,
+                verification_source,
+                observed_state,
+            )
+            .await
+        {
+            screenshot_path = Some(verified_screenshot);
+        }
+        let (confirmed_provider_status, confirmed_minecraft_status) = match &confirmation {
+            SubmissionConfirmation::Minecraft(status) => (
+                UNCONFIRMED_PROVIDER_STATUS.to_string(),
+                Some(status.to_string()),
+            ),
+            SubmissionConfirmation::Provider(status) => (status.clone(), None),
+        };
+        let mut final_minecraft_status =
+            confirmed_minecraft_status.or(verification.final_minecraft_status);
+        let mut outcome = match &confirmation {
+            SubmissionConfirmation::Provider(_) => "StartSubmittedConfirmed".to_string(),
+            SubmissionConfirmation::Minecraft(_) => "StartSubmittedUnconfirmed".to_string(),
+        };
         let mut final_error_class = None;
 
         if options.wait_online {
@@ -791,6 +949,7 @@ async fn handle_unconfirmed_submitted_start(
                 start_submitted_unconfirmed_wait_final_content(
                     &tracker.context.run_id,
                     ctx.data().provider.name(),
+                    &confirmed_provider_status,
                     &outcome,
                 ),
                 screenshot_path.clone(),
@@ -801,7 +960,7 @@ async fn handle_unconfirmed_submitted_start(
                 ctx,
                 progress_message,
                 notice,
-                start_submitted_unconfirmed_content(&tracker.context.run_id, &status),
+                start_submitted_unconfirmed_content(&tracker.context.run_id, &confirmation),
                 screenshot_path.clone(),
             )
             .await?;
@@ -810,7 +969,7 @@ async fn handle_unconfirmed_submitted_start(
         tracker
             .finish(
                 &outcome,
-                Some(UNCONFIRMED_PROVIDER_STATUS.to_string()),
+                Some(confirmed_provider_status),
                 final_minecraft_status,
                 screenshot_path,
                 final_error_class,
@@ -840,6 +999,44 @@ async fn handle_unconfirmed_submitted_start(
     Ok(())
 }
 
+fn spawn_submission_verification_guard(
+    active_lease: &ActiveStartLease,
+) -> tokio::task::JoinHandle<()> {
+    spawn_submission_verification_guard_for(
+        active_lease,
+        Duration::from_secs(POST_CLICK_VERIFY_SECS),
+    )
+}
+
+fn spawn_submission_verification_guard_for(
+    active_lease: &ActiveStartLease,
+    duration: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let guard = active_lease.operation_guard();
+    tokio::spawn(async move {
+        sleep(duration).await;
+        drop(guard);
+    })
+}
+
+fn retain_operation_guard_for_uncertain_result(
+    result: &Result<ProviderStartResult, ProviderStartFailure>,
+    guard: ActiveStartOperationGuard,
+    duration: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if result
+        .as_ref()
+        .is_err_and(|failure| failure.uncertain_mutation.may_have_started_server())
+    {
+        return Some(tokio::spawn(async move {
+            sleep(duration).await;
+            drop(guard);
+        }));
+    }
+    drop(guard);
+    None
+}
+
 fn provider_failure_public_content(error_class: &str, run_id: &str) -> String {
     if error_class == "ProviderAllocationTimeout" {
         return format!(
@@ -853,22 +1050,43 @@ fn status_confirms_start_submission(status: &ServerStatus) -> bool {
     !status.is_offline_like()
 }
 
-fn start_submission_checking_content(run_id: &str) -> String {
-    format!("Start may have been submitted. Checking Minecraft status...\nRun: `{run_id}`")
+fn provider_status_confirms_start_submission(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "starting" | "running" | "online" | "preparing" | "loading"
+    )
 }
 
-fn start_submitted_unconfirmed_content(run_id: &str, status: &ServerStatus) -> String {
-    format!(
-        "Start appears submitted, but provider confirmation was lost.\nMinecraft: **{status}**\nRun: `{run_id}`"
-    )
+fn start_submission_checking_content(run_id: &str, mutation: ProviderMutation) -> String {
+    let checks = match mutation {
+        ProviderMutation::PowerStart => "provider and Minecraft status",
+        ProviderMutation::BrowserStart => "Minecraft status",
+        ProviderMutation::None | ProviderMutation::WakeAllocation => "server status",
+    };
+    format!("Start may have been submitted. Checking {checks}...\nRun: `{run_id}`")
+}
+
+fn start_submitted_unconfirmed_content(
+    run_id: &str,
+    confirmation: &SubmissionConfirmation,
+) -> String {
+    match confirmation {
+        SubmissionConfirmation::Minecraft(status) => format!(
+            "Start appears submitted, but the power response was lost.\nMinecraft: **{status}**\nRun: `{run_id}`"
+        ),
+        SubmissionConfirmation::Provider(status) => format!(
+            "Start was confirmed after the power response was lost.\nProvider: **{status}**\nRun: `{run_id}`"
+        ),
+    }
 }
 
 fn start_submitted_unconfirmed_wait_final_content(
     run_id: &str,
     provider_name: &str,
+    provider_status: &str,
     outcome: &str,
 ) -> String {
-    start_final_content(run_id, provider_name, UNCONFIRMED_PROVIDER_STATUS, outcome)
+    start_final_content(run_id, provider_name, provider_status, outcome)
 }
 
 fn start_submission_unverified_content(run_id: &str) -> String {
@@ -878,6 +1096,8 @@ fn start_submission_unverified_content(run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn active_run_id_is_visible_to_owner_or_same_guild() {
@@ -976,25 +1196,53 @@ mod tests {
     }
 
     #[test]
+    fn provider_submission_status_detection_accepts_only_active_states() {
+        assert!(provider_status_confirms_start_submission("Starting"));
+        assert!(provider_status_confirms_start_submission("Running"));
+        assert!(provider_status_confirms_start_submission("Online"));
+        assert!(!provider_status_confirms_start_submission("Offline"));
+        assert!(!provider_status_confirms_start_submission(
+            "Allocation active"
+        ));
+    }
+
+    #[test]
     fn unconfirmed_start_public_content_is_short_and_scoped() {
-        let checking = start_submission_checking_content("abc123");
+        let checking = start_submission_checking_content("abc123", ProviderMutation::PowerStart);
         assert_eq!(
             checking,
+            "Start may have been submitted. Checking provider and Minecraft status...\nRun: `abc123`"
+        );
+        let browser_checking =
+            start_submission_checking_content("abc123", ProviderMutation::BrowserStart);
+        assert_eq!(
+            browser_checking,
             "Start may have been submitted. Checking Minecraft status...\nRun: `abc123`"
         );
 
-        let accepted = start_submitted_unconfirmed_content("abc123", &ServerStatus::Starting);
+        let accepted = start_submitted_unconfirmed_content(
+            "abc123",
+            &SubmissionConfirmation::Minecraft(ServerStatus::Starting),
+        );
         assert!(accepted.contains("Start appears submitted"));
         assert!(accepted.contains("Minecraft: **Starting**"));
         assert!(accepted.contains("Run: `abc123`"));
 
+        let provider_confirmed = start_submitted_unconfirmed_content(
+            "abc123",
+            &SubmissionConfirmation::Provider("Starting".to_string()),
+        );
+        assert!(provider_confirmed.contains("confirmed"));
+        assert!(provider_confirmed.contains("Provider: **Starting**"));
+
         let wait_done = start_submitted_unconfirmed_wait_final_content(
             "abc123",
             "pterodactyl",
+            "Starting",
             "MinecraftOnline",
         );
         assert!(wait_done.contains("Server is online."));
-        assert!(wait_done.contains("Provider (pterodactyl): **Unconfirmed"));
+        assert!(wait_done.contains("Provider (pterodactyl): **Starting"));
         assert!(wait_done.contains("Run: `abc123`"));
 
         let unverified = start_submission_unverified_content("abc123");
@@ -1002,5 +1250,89 @@ mod tests {
             unverified,
             "Start could not be verified after provider confirmation was lost.\nRun: `abc123`"
         );
+    }
+
+    #[tokio::test]
+    async fn submission_guard_handoff_keeps_admission_after_command_cancellation() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-submission-guard-cancel-{}",
+            rand::random::<u64>()
+        ));
+        let (lease, active_run) = ActiveStartLease::for_test(&artifact_dir, "run-1");
+
+        let provider_guard =
+            spawn_submission_verification_guard_for(&lease, Duration::from_millis(250));
+        let message_guard =
+            spawn_submission_verification_guard_for(&lease, Duration::from_millis(250));
+        provider_guard.abort();
+        let _ = provider_guard.await;
+        let verification_guard =
+            spawn_submission_verification_guard_for(&lease, Duration::from_millis(80));
+        message_guard.abort();
+        let _ = message_guard.await;
+
+        drop(lease);
+        tokio::task::yield_now().await;
+        assert!(active_run.lock().await.is_some());
+        sleep(Duration::from_millis(40)).await;
+        assert!(active_run.lock().await.is_some());
+        sleep(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+        assert!(active_run.lock().await.is_none());
+        assert!(verification_guard.is_finished());
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncertain_provider_result_retains_admission_if_command_is_cancelled() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-provider-emergency-guard-{}",
+            rand::random::<u64>()
+        ));
+        let (lease, active_run) = ActiveStartLease::for_test(&artifact_dir, "run-3");
+        let result = Err(ProviderStartFailure {
+            error_class: "ProviderPowerTimeout".to_string(),
+            message: "response timed out".to_string(),
+            screenshot_path: None,
+            detail_artifact_path: None,
+            minecraft_address: None,
+            uncertain_mutation: ProviderMutation::PowerStart,
+            retryable: false,
+        });
+        let emergency_guard = retain_operation_guard_for_uncertain_result(
+            &result,
+            lease.operation_guard(),
+            Duration::from_millis(80),
+        )
+        .expect("uncertain result should retain admission");
+
+        drop(lease);
+        tokio::task::yield_now().await;
+        assert!(active_run.lock().await.is_some());
+        sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert!(active_run.lock().await.is_none());
+        assert!(emergency_guard.is_finished());
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn submission_guard_releases_immediately_after_normal_completion() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-submission-guard-complete-{}",
+            rand::random::<u64>()
+        ));
+        let (lease, active_run): (ActiveStartLease, Arc<Mutex<Option<ActiveStartRun>>>) =
+            ActiveStartLease::for_test(&artifact_dir, "run-2");
+        let verification_guard =
+            spawn_submission_verification_guard_for(&lease, Duration::from_secs(60));
+
+        verification_guard.abort();
+        let _ = verification_guard.await;
+        drop(lease);
+        tokio::task::yield_now().await;
+
+        assert!(active_run.lock().await.is_none());
+        std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 }

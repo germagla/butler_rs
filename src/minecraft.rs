@@ -198,7 +198,14 @@ enum PingResult {
 async fn ping_once(connect_host: &str, port: u16, handshake_host: &str) -> Result<PingResult> {
     let response = timeout(Duration::from_secs(5), async {
         let mut stream = tokio::net::TcpStream::connect((connect_host, port)).await?;
-        let response = craftping::tokio::ping(&mut stream, handshake_host, port).await?;
+        let response = craftping::tokio::ping(&mut stream, handshake_host, port)
+            .await
+            .map_err(|error| match error {
+                craftping::Error::UnsupportedProtocol => {
+                    anyhow!("no Minecraft status response")
+                }
+                craftping::Error::Io(error) => error.into(),
+            })?;
         Ok::<craftping::Response, anyhow::Error>(response)
     })
     .await

@@ -1,6 +1,7 @@
 use crate::{
     config::PterodactylConfig,
     run_history::{ensure_owner_only_dir, ensure_owner_only_file},
+    runtime_lock::{RuntimeFileLock, acquire_runtime_lock, runtime_lock_has_live_owner},
     terminal,
 };
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,7 @@ const ORBSTACK_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const FLARESOLVERR_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(20);
 const HEALTH_FAILURE_THRESHOLD: usize = 3;
+const BORROWER_SHUTDOWN_WAIT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrbStackStatus {
@@ -30,6 +32,11 @@ enum OrbStackStatus {
 pub struct FlareSolverrSupervisor {
     shutdown_tx: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+}
+
+pub enum FlareSolverrOperationRuntime {
+    Borrowed(RuntimeFileLock),
+    Owned(FlareSolverrSupervisor),
 }
 
 #[derive(Clone)]
@@ -54,13 +61,38 @@ impl FlareSolverrRuntimeConfig {
 }
 
 impl FlareSolverrSupervisor {
+    pub async fn ensure_for_operation(
+        config: FlareSolverrRuntimeConfig,
+    ) -> Result<FlareSolverrOperationRuntime> {
+        let client = health_client()?;
+        if is_ready(&client, &config).await {
+            let container = inspect_container(&config).await?;
+            if !container.running {
+                bail!("FlareSolverrUnavailable: ready endpoint has no running container");
+            }
+            let usage_lock = acquire_runtime_lock(
+                &flaresolverr_usage_lock_path(&config)?,
+                "FlareSolverr usage",
+            )?;
+            if is_ready(&client, &config).await {
+                return Ok(FlareSolverrOperationRuntime::Borrowed(usage_lock));
+            }
+            drop(usage_lock);
+        }
+        Self::start(config)
+            .await
+            .map(FlareSolverrOperationRuntime::Owned)
+    }
+
     pub async fn start(config: FlareSolverrRuntimeConfig) -> Result<Self> {
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .context("could not build FlareSolverr health client")?;
+        let supervisor_lock_path = config
+            .ownership_marker
+            .parent()
+            .context("FlareSolverrConfiguration: ownership marker had no parent")?
+            .join(".flaresolverr-supervisor.lock");
+        let supervisor_lock =
+            acquire_runtime_lock(&supervisor_lock_path, "FlareSolverr supervisor")?;
+        let client = health_client()?;
 
         ensure_orbstack_running(&config).await?;
         let initial_container = inspect_container(&config).await?;
@@ -108,7 +140,13 @@ impl FlareSolverrSupervisor {
             };
             if recovery.is_ok() {
                 let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                let task = tokio::spawn(supervise(config, client, owned_container_id, shutdown_rx));
+                let task = tokio::spawn(supervise(
+                    config,
+                    client,
+                    owned_container_id,
+                    shutdown_rx,
+                    supervisor_lock,
+                ));
                 return Ok(Self {
                     shutdown_tx: Some(shutdown_tx),
                     task: Some(task),
@@ -123,7 +161,13 @@ impl FlareSolverrSupervisor {
         }
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(supervise(config, client, owned_container_id, shutdown_rx));
+        let task = tokio::spawn(supervise(
+            config,
+            client,
+            owned_container_id,
+            shutdown_rx,
+            supervisor_lock,
+        ));
 
         Ok(Self {
             shutdown_tx: Some(shutdown_tx),
@@ -143,11 +187,30 @@ impl FlareSolverrSupervisor {
     }
 }
 
+impl FlareSolverrOperationRuntime {
+    pub async fn shutdown(self) {
+        match self {
+            Self::Borrowed(usage_lock) => drop(usage_lock),
+            Self::Owned(supervisor) => supervisor.shutdown().await,
+        }
+    }
+}
+
+fn health_client() -> Result<Client> {
+    Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("could not build FlareSolverr health client")
+}
+
 async fn supervise(
     config: FlareSolverrRuntimeConfig,
     client: Client,
     mut owned_container_id: Option<String>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    _supervisor_lock: RuntimeFileLock,
 ) {
     let mut ticker = interval(MONITOR_INTERVAL);
     let mut consecutive_health_failures = 0;
@@ -184,9 +247,60 @@ async fn supervise(
     }
 
     if let Some(container_id) = owned_container_id {
+        let Some(_usage_guard) = wait_for_flaresolverr_borrowers(&config).await else {
+            emit_warning(
+                "shutdown left owned container running",
+                "could not safely exclude borrowed operations",
+            );
+            return;
+        };
         match stop_owned_container(&config, &container_id).await {
             Ok(()) => remove_ownership_marker(&config),
             Err(error) => emit_warning("shutdown could not stop container", &error.to_string()),
+        }
+    }
+}
+
+fn flaresolverr_usage_lock_path(config: &FlareSolverrRuntimeConfig) -> Result<std::path::PathBuf> {
+    Ok(config
+        .ownership_marker
+        .parent()
+        .context("FlareSolverrConfiguration: ownership marker had no parent")?
+        .join(".flaresolverr-use.lock"))
+}
+
+async fn wait_for_flaresolverr_borrowers(
+    config: &FlareSolverrRuntimeConfig,
+) -> Option<RuntimeFileLock> {
+    let path = match flaresolverr_usage_lock_path(config) {
+        Ok(path) => path,
+        Err(error) => {
+            emit_warning("could not construct usage lock", &error.to_string());
+            return None;
+        }
+    };
+    let deadline = Instant::now() + BORROWER_SHUTDOWN_WAIT;
+    loop {
+        if Instant::now() >= deadline {
+            emit_warning(
+                "timed out waiting for borrowed operations",
+                "leaving the container running",
+            );
+            return None;
+        }
+        match acquire_runtime_lock(&path, "FlareSolverr usage") {
+            Ok(lock) => return Some(lock),
+            Err(error) => match runtime_lock_has_live_owner(&path, "FlareSolverr usage") {
+                Ok(true) => sleep(Duration::from_millis(250)).await,
+                Ok(false) => sleep(Duration::from_millis(50)).await,
+                Err(inspect_error) => {
+                    emit_warning(
+                        "could not inspect usage lock",
+                        &format!("{error}; {inspect_error}"),
+                    );
+                    return None;
+                }
+            },
         }
     }
 }
@@ -197,11 +311,39 @@ fn write_ownership_marker(config: &FlareSolverrRuntimeConfig, container_id: &str
         .parent()
         .context("FlareSolverrConfiguration: ownership marker had no parent")?;
     ensure_owner_only_dir(parent)?;
-    std::fs::write(&config.ownership_marker, format!("{container_id}\n"))?;
-    ensure_owner_only_file(&config.ownership_marker)
+    match std::fs::symlink_metadata(&config.ownership_marker) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&config.ownership_marker)
+                .context("could not replace stale FlareSolverr ownership marker")?;
+        }
+        Ok(_) => bail!("FlareSolverrConfiguration: ownership marker is not a safe regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("could not inspect FlareSolverr ownership marker"),
+    }
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options
+            .open(&config.ownership_marker)
+            .context("could not create FlareSolverr ownership marker")?;
+        use std::io::Write as _;
+        file.write_all(format!("{container_id}\n").as_bytes())?;
+        file.sync_all()?;
+        ensure_owner_only_file(&config.ownership_marker)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&config.ownership_marker);
+    }
+    result
 }
 
 fn read_ownership_marker(config: &FlareSolverrRuntimeConfig) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(&config.ownership_marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("could not inspect FlareSolverr ownership marker"),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("FlareSolverrConfiguration: ownership marker is not a safe regular file"),
+    }
     match std::fs::read_to_string(&config.ownership_marker) {
         Ok(value) => {
             let value = value.trim();
@@ -210,7 +352,6 @@ fn read_ownership_marker(config: &FlareSolverrRuntimeConfig) -> Result<Option<St
             }
             Ok(Some(value.to_string()))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -234,7 +375,21 @@ async fn ensure_runtime_healthy(
 
     ensure_orbstack_running(config).await?;
     let container = inspect_container(config).await?;
-    match container_recovery_action(&container, owned_container_id) {
+    let action = container_recovery_action(&container, owned_container_id);
+    let _usage_guard = if matches!(
+        action,
+        ContainerRecoveryAction::RestartOwned
+            | ContainerRecoveryAction::StartOwned
+            | ContainerRecoveryAction::StartAndAdopt
+    ) {
+        Some(
+            acquire_runtime_lock(&flaresolverr_usage_lock_path(config)?, "FlareSolverr usage")
+                .context("FlareSolverrUnavailable: a borrowed operation is active")?,
+        )
+    } else {
+        None
+    };
+    match action {
         ContainerRecoveryAction::RestartOwned => {
             let expected_id = owned_container_id.expect("owned recovery requires an ID");
             restart_container(config, expected_id).await?;
@@ -553,6 +708,7 @@ fn emit_warning(action: &str, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[cfg(unix)]
     fn exit_status(code: i32) -> ExitStatus {
@@ -602,6 +758,136 @@ mod tests {
         assert!(is_ready_body(br#"{"msg":"FlareSolverr is ready!"}"#));
         assert!(!is_ready_body(br#"{"msg":"starting"}"#));
         assert!(!is_ready_body(b"not json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_borrows_ready_runtime_without_supervisor_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = r#"{"msg":"FlareSolverr is ready!"}"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-flaresolverr-borrow-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let docker_path = artifact_dir.join("docker");
+        std::fs::write(
+            &docker_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' '[{{\"Id\":\"abcdef123456\",\"State\":{{\"Running\":true}},\"Config\":{{\"Image\":\"ghcr.io/flaresolverr/flaresolverr@sha256:abc\",\"Labels\":{{\"com.docker.compose.service\":\"flaresolverr\"}}}},\"HostConfig\":{{\"RestartPolicy\":{{\"Name\":\"no\"}},\"PortBindings\":{{\"8191/tcp\":[{{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"{}\"}}]}}}}}}]'\n",
+                address.port()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = FlareSolverrRuntimeConfig {
+            flaresolverr_url: format!("http://{address}/").parse().unwrap(),
+            flaresolverr_container: "unused".to_string(),
+            orbctl_path: "/does/not/exist".into(),
+            docker_path,
+            ownership_marker: artifact_dir.join(".flaresolverr-owned"),
+        };
+
+        let runtime = FlareSolverrSupervisor::ensure_for_operation(config)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &runtime,
+            FlareSolverrOperationRuntime::Borrowed(_)
+        ));
+        assert!(artifact_dir.join(".flaresolverr-use.lock").is_file());
+        assert!(!artifact_dir.join(".flaresolverr-supervisor.lock").exists());
+        runtime.shutdown().await;
+        assert!(!artifact_dir.join(".flaresolverr-use.lock").exists());
+        server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_borrowed_runtime_usage() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-flaresolverr-usage-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let config = FlareSolverrRuntimeConfig {
+            flaresolverr_url: "http://127.0.0.1:8191/".parse().unwrap(),
+            flaresolverr_container: "unused".to_string(),
+            orbctl_path: "/does/not/exist".into(),
+            docker_path: "/does/not/exist".into(),
+            ownership_marker: artifact_dir.join(".flaresolverr-owned"),
+        };
+        let usage_lock = acquire_runtime_lock(
+            &artifact_dir.join(".flaresolverr-use.lock"),
+            "FlareSolverr usage",
+        )
+        .unwrap();
+        let wait_config = config.clone();
+        let mut waiter =
+            tokio::spawn(async move { wait_for_flaresolverr_borrowers(&wait_config).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(usage_lock);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(acquired);
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_marker_rejects_symlinks_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-flaresolverr-marker-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let target = artifact_dir.join("target");
+        std::fs::write(&target, "preserve\n").unwrap();
+        let marker = artifact_dir.join(".flaresolverr-owned");
+        symlink(&target, &marker).unwrap();
+        let config = FlareSolverrRuntimeConfig {
+            flaresolverr_url: "http://127.0.0.1:8191/".parse().unwrap(),
+            flaresolverr_container: "unused".to_string(),
+            orbctl_path: "/does/not/exist".into(),
+            docker_path: "/does/not/exist".into(),
+            ownership_marker: marker,
+        };
+
+        assert!(read_ownership_marker(&config).is_err());
+        assert!(write_ownership_marker(&config, "abcdef").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserve\n");
+        std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
     #[test]

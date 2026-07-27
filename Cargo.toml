@@ -16,6 +16,9 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 dotenvy = "0.15"
 anyhow = "1"
+chrono = "0.4"
+font8x8 = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 rand = "0.8"
 craftping = { version = "0.7", features = ["async-tokio"] }

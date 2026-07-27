@@ -1,18 +1,21 @@
 mod lifecycle;
+mod snapshot;
 
 pub use lifecycle::{FlareSolverrRuntimeConfig, FlareSolverrSupervisor};
 
 use crate::{
     config::{ArtifactCapture, PterodactylConfig},
     provider::{
-        ProviderMutation, ProviderProgress, ProviderProgressSender, ProviderProgressStage,
-        ProviderStartFailure, ProviderStartFuture, ProviderStartResult, ServerStartProvider,
-        StartOutcome,
+        ProviderArtifactFuture, ProviderCheckFuture, ProviderCheckResult, ProviderMutation,
+        ProviderProgress, ProviderProgressSender, ProviderProgressStage, ProviderStartFailure,
+        ProviderStartFuture, ProviderStartResult, ServerStartProvider, StartOutcome,
+        SubmissionVerificationSource,
     },
-    run_history::{ensure_owner_only_file, mark_run_artifact_dir},
+    run_history::{mark_run_artifact_dir, write_owner_only_atomic},
     terminal,
 };
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::{
     Client, Response, StatusCode,
     header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue, USER_AGENT},
@@ -31,6 +34,7 @@ use tokio::{
 use url::Url;
 
 const API_TIMEOUT: Duration = Duration::from_secs(15);
+const POWER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const FLARESOLVERR_REQUEST_TIMEOUT_MS: u64 = 180_000;
 const FLARESOLVERR_TIMEOUT: Duration = Duration::from_secs(195);
 const FLARESOLVERR_CLEARANCE_ATTEMPTS: usize = 2;
@@ -42,8 +46,10 @@ const ALLOCATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const SUBMISSION_VERIFY_ATTEMPTS: usize = 12;
 const SUBMISSION_VERIFY_INTERVAL: Duration = Duration::from_secs(5);
 const SUBMISSION_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+const SUBMISSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const STATE_ARTIFACT: &str = "provider_state.json";
+const SNAPSHOT_ARTIFACT: &str = "provider_snapshot.png";
 
 pub struct PterodactylProvider {
     config: PterodactylConfig,
@@ -54,6 +60,7 @@ pub struct PterodactylProvider {
     clearance: Mutex<Option<Clearance>>,
     allocation_wait_timeout: Duration,
     allocation_wait_interval: Duration,
+    submission_probe_timeout: Duration,
 }
 
 impl PterodactylProvider {
@@ -84,6 +91,7 @@ impl PterodactylProvider {
             clearance: Mutex::new(None),
             allocation_wait_timeout,
             allocation_wait_interval: ALLOCATION_WAIT_INTERVAL,
+            submission_probe_timeout: SUBMISSION_PROBE_TIMEOUT,
         })
     }
 
@@ -116,7 +124,7 @@ impl PterodactylProvider {
                     .ensure_limbo_awake(run_id, &details.uuid, progress)
                     .await
                     .map_err(|mut failure| {
-                        failure.detail_artifact_path = artifact_path.clone();
+                        backfill_failure_artifacts(&mut failure, artifact_path.clone());
                         failure
                     })?;
                 minecraft_address = allocation_result.minecraft_address.clone();
@@ -143,19 +151,23 @@ impl PterodactylProvider {
                         .ensure_limbo_awake(run_id, &refreshed.uuid, progress)
                         .await
                         .map_err(|mut failure| {
-                            failure.detail_artifact_path = artifact_path.clone();
+                            backfill_failure_artifacts(&mut failure, artifact_path.clone());
                             failure
                         })?;
                     minecraft_address = allocation_result.minecraft_address.clone();
                     allocation = Some(allocation_result);
-                    self.resources_with_refresh()
-                        .await
-                        .map_err(|failure| attach_minecraft_address(failure, &minecraft_address))?
+                    self.resources_with_refresh().await.map_err(|mut failure| {
+                        backfill_failure_artifacts(&mut failure, artifact_path.clone());
+                        attach_minecraft_address(failure, &minecraft_address)
+                    })?
                 } else {
+                    let mut failure = failure;
+                    backfill_failure_artifacts(&mut failure, artifact_path);
                     return Err(failure);
                 }
             }
-            Err(failure) => {
+            Err(mut failure) => {
+                backfill_failure_artifacts(&mut failure, artifact_path);
                 return Err(attach_minecraft_address(failure, &minecraft_address));
             }
         };
@@ -184,10 +196,10 @@ impl PterodactylProvider {
         if action == StateAction::WaitForStopping {
             for _ in 0..STOPPING_WAIT_ATTEMPTS {
                 sleep(STOPPING_WAIT_INTERVAL).await;
-                resources = self
-                    .resources_with_refresh()
-                    .await
-                    .map_err(|failure| attach_minecraft_address(failure, &minecraft_address))?;
+                resources = self.resources_with_refresh().await.map_err(|mut failure| {
+                    backfill_failure_artifacts(&mut failure, artifact_path.clone());
+                    attach_minecraft_address(failure, &minecraft_address)
+                })?;
                 artifact_path = self
                     .write_state_artifact(
                         run_id,
@@ -216,13 +228,16 @@ impl PterodactylProvider {
         }
 
         match action {
-            StateAction::AlreadyActive => Ok(ProviderStartResult {
-                outcome: StartOutcome::AlreadyActive,
-                provider_status: normalized_state(&resources.current_state),
-                minecraft_address,
-                screenshot_path: None,
-                detail_artifact_path: artifact_path,
-            }),
+            StateAction::AlreadyActive => {
+                let screenshot_path = snapshot_path_for_detail(artifact_path.as_ref());
+                Ok(ProviderStartResult {
+                    outcome: StartOutcome::AlreadyActive,
+                    provider_status: normalized_state(&resources.current_state),
+                    minecraft_address,
+                    screenshot_path,
+                    detail_artifact_path: artifact_path,
+                })
+            }
             StateAction::RequestStart => {
                 if !self.config.power_enabled {
                     return Err(attach_minecraft_address(
@@ -240,38 +255,158 @@ impl PterodactylProvider {
                     ProviderProgressStage::RequestingPower,
                     "Host allocation is ready; requesting server power",
                 );
+                let activity_baseline =
+                    timeout(self.submission_probe_timeout, self.activity_with_refresh())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|activity| activity.first().map(|item| item.id.clone()));
                 artifact_path = self
                     .write_power_state_artifact(
                         run_id,
-                        &resources.current_state,
-                        resources.is_suspended,
-                        is_limbo,
-                        false,
-                        allocation.as_ref(),
+                        PowerArtifactState {
+                            current_state: &resources.current_state,
+                            is_suspended: resources.is_suspended,
+                            is_limbo,
+                            submission_state: PowerSubmissionState::Dispatching,
+                            allocation: allocation.as_ref(),
+                            last_error: None,
+                            confirmation_source: None,
+                        },
                     )
                     .await
                     .or(artifact_path);
-                self.send_start_power().await.map_err(|mut failure| {
-                    failure.detail_artifact_path = artifact_path.clone();
-                    failure.minecraft_address = minecraft_address.clone();
-                    failure
-                })?;
+                let attempted_at = Utc::now();
+                let confirmation = match self.send_start_power().await {
+                    Ok(()) => PowerConfirmation::accepted(),
+                    Err(failure) if failure.uncertain_mutation.may_have_started_server() => {
+                        let original_error =
+                            format!("{}: {}", failure.error_class, failure.message);
+                        artifact_path = self
+                            .write_power_state_artifact(
+                                run_id,
+                                PowerArtifactState {
+                                    current_state: &resources.current_state,
+                                    is_suspended: resources.is_suspended,
+                                    is_limbo,
+                                    submission_state: PowerSubmissionState::Ambiguous,
+                                    allocation: allocation.as_ref(),
+                                    last_error: Some(&original_error),
+                                    confirmation_source: None,
+                                },
+                            )
+                            .await
+                            .or(artifact_path);
+                        emit_progress(
+                            progress,
+                            ProviderProgressStage::VerifyingPower,
+                            "Power response was ambiguous; checking provider state and activity",
+                        );
+                        match self
+                            .verify_ambiguous_power(
+                                failure,
+                                attempted_at,
+                                activity_baseline.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(mut confirmation) => {
+                                confirmation.original_error = Some(original_error);
+                                confirmation
+                            }
+                            Err(mut attempt) => {
+                                let current_state = attempt
+                                    .last_provider_state
+                                    .as_deref()
+                                    .unwrap_or(&resources.current_state);
+                                let last_error = format!(
+                                    "{}: {}",
+                                    attempt.failure.error_class, attempt.failure.message
+                                );
+                                let failure_artifact_path = self
+                                    .write_power_state_artifact(
+                                        run_id,
+                                        PowerArtifactState {
+                                            current_state,
+                                            is_suspended: resources.is_suspended,
+                                            is_limbo,
+                                            submission_state: PowerSubmissionState::Ambiguous,
+                                            allocation: allocation.as_ref(),
+                                            last_error: Some(&last_error),
+                                            confirmation_source: None,
+                                        },
+                                    )
+                                    .await;
+                                artifact_path = failure_artifact_path.clone().or(artifact_path);
+                                set_failure_artifacts(
+                                    &mut attempt.failure,
+                                    artifact_path,
+                                    failure_artifact_path.as_ref(),
+                                );
+                                attempt.failure.minecraft_address = minecraft_address;
+                                return Err(attempt.failure);
+                            }
+                        }
+                    }
+                    Err(failure) => {
+                        let mut attempt = PowerAttemptFailure::new(failure);
+                        let current_state = attempt
+                            .last_provider_state
+                            .as_deref()
+                            .unwrap_or(&resources.current_state);
+                        let last_error = format!(
+                            "{}: {}",
+                            attempt.failure.error_class, attempt.failure.message
+                        );
+                        let failure_artifact_path = self
+                            .write_power_state_artifact(
+                                run_id,
+                                PowerArtifactState {
+                                    current_state,
+                                    is_suspended: resources.is_suspended,
+                                    is_limbo,
+                                    submission_state: PowerSubmissionState::Rejected,
+                                    allocation: allocation.as_ref(),
+                                    last_error: Some(&last_error),
+                                    confirmation_source: None,
+                                },
+                            )
+                            .await;
+                        artifact_path = failure_artifact_path.clone().or(artifact_path);
+                        set_failure_artifacts(
+                            &mut attempt.failure,
+                            artifact_path,
+                            failure_artifact_path.as_ref(),
+                        );
+                        attempt.failure.minecraft_address = minecraft_address;
+                        return Err(attempt.failure);
+                    }
+                };
+                let confirmed_state = confirmation
+                    .provider_state
+                    .as_deref()
+                    .unwrap_or(&resources.current_state);
                 artifact_path = self
                     .write_power_state_artifact(
                         run_id,
-                        "starting",
-                        resources.is_suspended,
-                        is_limbo,
-                        true,
-                        allocation.as_ref(),
+                        PowerArtifactState {
+                            current_state: confirmed_state,
+                            is_suspended: resources.is_suspended,
+                            is_limbo,
+                            submission_state: PowerSubmissionState::Confirmed,
+                            allocation: allocation.as_ref(),
+                            last_error: confirmation.original_error.as_deref(),
+                            confirmation_source: Some(confirmation.source),
+                        },
                     )
                     .await
                     .or(artifact_path);
+                let screenshot_path = snapshot_path_for_detail(artifact_path.as_ref());
                 Ok(ProviderStartResult {
                     outcome: StartOutcome::StartRequested,
                     provider_status: "Start requested".to_string(),
                     minecraft_address,
-                    screenshot_path: None,
+                    screenshot_path,
                     detail_artifact_path: artifact_path,
                 })
             }
@@ -294,6 +429,74 @@ impl PterodactylProvider {
                 &minecraft_address,
             )),
         }
+    }
+
+    async fn start_with_terminal_artifacts(
+        &self,
+        run_id: &str,
+        progress: Option<&ProviderProgressSender>,
+    ) -> Result<ProviderStartResult, ProviderStartFailure> {
+        match self.start_inner(run_id, progress).await {
+            Ok(result) => Ok(result),
+            Err(mut failure) => {
+                if failure.uncertain_mutation.may_have_started_server()
+                    || failure.screenshot_path.is_none()
+                {
+                    failure.screenshot_path = self
+                        .write_terminal_failure_snapshot(
+                            run_id,
+                            &failure.error_class,
+                            failure.uncertain_mutation,
+                        )
+                        .await;
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    async fn check_inner(&self) -> Result<ProviderCheckResult, ProviderStartFailure> {
+        let details = self.details_with_refresh().await?;
+        if details.is_suspended && !details.is_limbo {
+            return Ok(provider_check_result("Suspended", None));
+        }
+        if details.is_limbo {
+            let allocation = self.sleep_status_with_refresh(&details.uuid).await?;
+            let minecraft_address = minecraft_connection(&allocation);
+            if sleep_status_allocation_ready(&allocation) {
+                match self.resources_with_refresh().await {
+                    Ok(resources) => {
+                        return Ok(provider_check_result(
+                            if resources.is_suspended {
+                                "Suspended".to_string()
+                            } else {
+                                normalized_state(&resources.current_state)
+                            },
+                            minecraft_address,
+                        ));
+                    }
+                    Err(failure) if failure.error_class == "ProviderStateConflict" => {}
+                    Err(failure) => return Err(failure),
+                }
+            }
+            return Ok(provider_check_result(
+                format!(
+                    "Allocation {}",
+                    allocation.phase.trim().to_ascii_lowercase()
+                ),
+                minecraft_address,
+            ));
+        }
+
+        let resources = self.resources_with_refresh().await?;
+        Ok(provider_check_result(
+            if resources.is_suspended {
+                "Suspended".to_string()
+            } else {
+                normalized_state(&resources.current_state)
+            },
+            None,
+        ))
     }
 
     async fn resources_with_refresh(&self) -> Result<PterodactylResources, ProviderStartFailure> {
@@ -321,6 +524,22 @@ impl PterodactylProvider {
                 let refreshed = self.refresh_clearance().await?;
                 *self.clearance.lock().await = Some(refreshed.clone());
                 self.fetch_details(Some(&refreshed))
+                    .await
+                    .map_err(ApiError::into_provider_failure)
+            }
+            Err(error) => Err(error.into_provider_failure()),
+        }
+    }
+
+    async fn activity_with_refresh(&self) -> Result<Vec<ServerActivity>, ProviderStartFailure> {
+        let cached = self.cached_clearance().await;
+
+        match self.fetch_activity(cached.as_ref()).await {
+            Ok(activity) => Ok(activity),
+            Err(error) if error.challenge => {
+                let refreshed = self.refresh_clearance().await?;
+                *self.clearance.lock().await = Some(refreshed.clone());
+                self.fetch_activity(Some(&refreshed))
                     .await
                     .map_err(ApiError::into_provider_failure)
             }
@@ -408,6 +627,46 @@ impl PterodactylProvider {
         ))
     }
 
+    async fn fetch_activity(
+        &self,
+        clearance: Option<&Clearance>,
+    ) -> Result<Vec<ServerActivity>, ApiError> {
+        let mut url = self.api_url(&self.config.server_id, Some("activity"))?;
+        url.query_pairs_mut()
+            .append_pair("sort", "-timestamp")
+            .append_pair("filter[event]", "server:power.start");
+        let request = self.api_request(self.api_client.get(url), clearance)?;
+        let response = request.send().await.map_err(|_| {
+            ApiError::transient(
+                "ProviderUnavailable",
+                "Provider activity request could not be completed",
+            )
+        })?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response_body(response).await?;
+
+        if status == StatusCode::OK {
+            let envelope: ActivityEnvelope = serde_json::from_slice(&body).map_err(|_| {
+                ApiError::definitive(
+                    "ProviderProtocol",
+                    "Provider activity response was not valid JSON",
+                )
+            })?;
+            return Ok(envelope
+                .data
+                .into_iter()
+                .map(|item| item.attributes)
+                .collect());
+        }
+        Err(classify_api_response(
+            status,
+            &headers,
+            &body,
+            ProviderMutation::None,
+        ))
+    }
+
     async fn send_start_power(&self) -> Result<(), ProviderStartFailure> {
         let clearance = self.clearance.lock().await.clone();
         let url = self
@@ -416,19 +675,12 @@ impl PterodactylProvider {
         let request = self
             .api_request(self.api_client.post(url), clearance.as_ref())
             .map_err(ApiError::into_provider_failure)?
+            .timeout(POWER_REQUEST_TIMEOUT)
             .json(&serde_json::json!({"signal": "start"}));
 
         let response = match request.send().await {
             Ok(response) => response,
-            Err(_) => {
-                let failure = provider_failure(
-                    "ProviderPowerAmbiguous",
-                    "The power request connection ended before confirmation",
-                    None,
-                    ProviderMutation::PowerStart,
-                );
-                return self.verify_ambiguous_power(failure).await;
-            }
+            Err(error) => return Err(classify_power_request_error(&error)),
         };
         let status = response.status();
         if status == StatusCode::NO_CONTENT {
@@ -436,13 +688,11 @@ impl PterodactylProvider {
         }
         let headers = response.headers().clone();
         let body = response_body(response).await.unwrap_or_default();
-        let failure = classify_api_response(status, &headers, &body, ProviderMutation::PowerStart)
-            .into_provider_failure();
-        if failure.uncertain_mutation.may_have_started_server() {
-            self.verify_ambiguous_power(failure).await
-        } else {
-            Err(failure)
-        }
+        let mut failure =
+            classify_api_response(status, &headers, &body, ProviderMutation::PowerStart)
+                .into_provider_failure();
+        failure.message = power_response_failure_message(status, &headers, &failure.message);
+        Err(failure)
     }
 
     async fn send_wake(&self, server_uuid: &str) -> Result<(), ProviderStartFailure> {
@@ -673,28 +923,82 @@ impl PterodactylProvider {
 
     async fn verify_ambiguous_power(
         &self,
-        failure: ProviderStartFailure,
-    ) -> Result<(), ProviderStartFailure> {
+        mut failure: ProviderStartFailure,
+        attempted_at: DateTime<Utc>,
+        activity_baseline: Option<&str>,
+    ) -> Result<PowerConfirmation, PowerAttemptFailure> {
         let deadline = Instant::now() + SUBMISSION_VERIFY_TIMEOUT;
+        let mut last_provider_state = None;
+        let mut last_verification_error = None;
         for attempt in 0..SUBMISSION_VERIFY_ATTEMPTS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match timeout(remaining, self.resources_with_refresh()).await {
-                Ok(Ok(resources))
-                    if action_for_state(&resources.current_state) == StateAction::AlreadyActive =>
+            match timeout(
+                std::cmp::min(remaining, SUBMISSION_PROBE_TIMEOUT),
+                self.resources_with_refresh(),
+            )
+            .await
+            {
+                Ok(Ok(resources)) => {
+                    last_provider_state = Some(resources.current_state.clone());
+                    if action_for_state(&resources.current_state) == StateAction::AlreadyActive {
+                        return Ok(PowerConfirmation {
+                            source: PowerConfirmationSource::Resources,
+                            provider_state: Some(resources.current_state),
+                            original_error: None,
+                        });
+                    }
+                }
+                Ok(Err(verification_failure)) => {
+                    last_verification_error = Some(format!(
+                        "{}: {}",
+                        verification_failure.error_class, verification_failure.message
+                    ));
+                }
+                Err(_) => {
+                    last_verification_error =
+                        Some("Provider resources verification probe timed out".to_string());
+                }
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(
+                std::cmp::min(remaining, SUBMISSION_PROBE_TIMEOUT),
+                self.activity_with_refresh(),
+            )
+            .await
+            {
+                Ok(Ok(activity))
+                    if activity_confirms_power_start(
+                        &activity,
+                        activity_baseline,
+                        attempted_at,
+                    ) =>
                 {
-                    return Ok(());
+                    return Ok(PowerConfirmation {
+                        source: PowerConfirmationSource::Activity,
+                        provider_state: last_provider_state,
+                        original_error: None,
+                    });
                 }
                 Ok(Ok(_)) => {}
-                Ok(Err(verification_failure)) if verification_failure.retryable => {}
-                Ok(Err(mut verification_failure)) => {
-                    verification_failure.uncertain_mutation = ProviderMutation::PowerStart;
-                    return Err(verification_failure);
+                Ok(Err(verification_failure)) => {
+                    last_verification_error = Some(format!(
+                        "{}: {}",
+                        verification_failure.error_class, verification_failure.message
+                    ));
                 }
-                Err(_) => break,
+                Err(_) => {
+                    last_verification_error =
+                        Some("Provider activity verification probe timed out".to_string());
+                }
             }
+
             if attempt + 1 < SUBMISSION_VERIFY_ATTEMPTS {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -703,7 +1007,15 @@ impl PterodactylProvider {
                 sleep(std::cmp::min(SUBMISSION_VERIFY_INTERVAL, remaining)).await;
             }
         }
-        Err(failure)
+        append_power_verification_detail(
+            &mut failure.message,
+            last_provider_state.as_deref(),
+            last_verification_error.as_deref(),
+        );
+        Err(PowerAttemptFailure {
+            failure,
+            last_provider_state,
+        })
     }
 
     async fn verify_ambiguous_wake(
@@ -918,11 +1230,51 @@ impl PterodactylProvider {
                 blocked: None,
                 enabled: None,
                 wake_requested: false,
-                power_requested: false,
                 last_error: None,
+                power_submission_state: None,
+                power_confirmation_source: None,
             },
         )
         .await
+    }
+
+    async fn write_verified_submission_artifact(
+        &self,
+        run_id: &str,
+        source: SubmissionVerificationSource,
+        observed_state: &str,
+    ) -> Option<PathBuf> {
+        let detail_path = self
+            .write_state_artifact_value(
+                run_id,
+                &StateArtifact {
+                    provider: "pterodactyl",
+                    workflow_stage: "submission_verified",
+                    current_state: Some(observed_state),
+                    is_suspended: None,
+                    is_limbo: None,
+                    phase: None,
+                    connection: None,
+                    position: None,
+                    total: None,
+                    estimated_minutes: None,
+                    blocked: None,
+                    enabled: None,
+                    wake_requested: false,
+                    last_error: None,
+                    power_submission_state: Some(PowerSubmissionState::Confirmed),
+                    power_confirmation_source: Some(match source {
+                        SubmissionVerificationSource::Provider => {
+                            PowerConfirmationSource::ProviderVerification
+                        }
+                        SubmissionVerificationSource::Minecraft => {
+                            PowerConfirmationSource::Minecraft
+                        }
+                    }),
+                },
+            )
+            .await;
+        snapshot_path_for_detail(detail_path.as_ref())
     }
 
     async fn write_allocation_state_artifact(
@@ -948,8 +1300,9 @@ impl PterodactylProvider {
                 blocked: status.blocked,
                 enabled: status.enabled,
                 wake_requested,
-                power_requested: false,
                 last_error,
+                power_submission_state: None,
+                power_confirmation_source: None,
             },
         )
         .await
@@ -958,21 +1311,17 @@ impl PterodactylProvider {
     async fn write_power_state_artifact(
         &self,
         run_id: &str,
-        current_state: &str,
-        is_suspended: bool,
-        is_limbo: bool,
-        power_requested: bool,
-        allocation: Option<&AllocationResult>,
+        state: PowerArtifactState<'_>,
     ) -> Option<PathBuf> {
-        let allocation_status = allocation.map(|allocation| &allocation.status);
+        let allocation_status = state.allocation.map(|allocation| &allocation.status);
         self.write_state_artifact_value(
             run_id,
             &StateArtifact {
                 provider: "pterodactyl",
                 workflow_stage: "power_start",
-                current_state: Some(current_state),
-                is_suspended: Some(is_suspended),
-                is_limbo: Some(is_limbo),
+                current_state: Some(state.current_state),
+                is_suspended: Some(state.is_suspended),
+                is_limbo: Some(state.is_limbo),
                 phase: allocation_status.map(|status| status.phase.as_str()),
                 connection: allocation_status.and_then(|status| status.connection.as_deref()),
                 position: allocation_status.and_then(|status| status.position),
@@ -980,9 +1329,12 @@ impl PterodactylProvider {
                 estimated_minutes: allocation_status.and_then(|status| status.estimated_minutes),
                 blocked: allocation_status.and_then(|status| status.blocked),
                 enabled: allocation_status.and_then(|status| status.enabled),
-                wake_requested: allocation.is_some_and(|allocation| allocation.wake_requested),
-                power_requested,
-                last_error: None,
+                wake_requested: state
+                    .allocation
+                    .is_some_and(|allocation| allocation.wake_requested),
+                last_error: state.last_error,
+                power_submission_state: Some(state.submission_state),
+                power_confirmation_source: state.confirmation_source,
             },
         )
         .await
@@ -993,33 +1345,118 @@ impl PterodactylProvider {
         run_id: &str,
         artifact: &StateArtifact<'_>,
     ) -> Option<PathBuf> {
+        let run_dir = self.artifact_dir.join(run_id);
         if self.artifact_capture == ArtifactCapture::Off {
+            if let Err(error) =
+                remove_snapshot_artifact_async(run_dir.join(SNAPSHOT_ARTIFACT)).await
+            {
+                emit_snapshot_warning(run_id, &error);
+            }
             return None;
         }
-        let run_dir = self.artifact_dir.join(run_id);
         let path = run_dir.join(STATE_ARTIFACT);
-        let result = (|| -> Result<()> {
-            mark_run_artifact_dir(&run_dir)?;
-            let bytes = serde_json::to_vec_pretty(artifact)?;
-            std::fs::write(&path, bytes)?;
-            ensure_owner_only_file(&path)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Some(path),
+        let bytes = match serde_json::to_vec_pretty(artifact) {
+            Ok(bytes) => bytes,
             Err(error) => {
-                terminal::emit(terminal::line(
-                    "WARN",
-                    "artifacts",
-                    "",
-                    "",
-                    None,
-                    format!(
-                        "could not write sanitized provider state for run {}; error {}",
-                        run_id,
-                        terminal::clean(&error.to_string())
-                    ),
-                ));
+                emit_state_artifact_warning(run_id, &error.into());
+                return None;
+            }
+        };
+        let write_run_dir = run_dir.clone();
+        let write_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            mark_run_artifact_dir(&write_run_dir)?;
+            write_owner_only_atomic(&write_path, &bytes)
+        })
+        .await
+        .context("provider state artifact task failed")
+        .and_then(|result| result);
+        match result {
+            Ok(()) => {
+                let snapshot_path = run_dir.join(SNAPSHOT_ARTIFACT);
+                if should_capture_snapshot(self.artifact_capture, artifact) {
+                    let _ = self.write_snapshot_artifact(run_id, artifact).await;
+                } else if let Err(error) = remove_snapshot_artifact_async(snapshot_path).await {
+                    emit_snapshot_warning(run_id, &error);
+                }
+                Some(path)
+            }
+            Err(error) => {
+                if let Err(cleanup_error) =
+                    remove_snapshot_artifact_async(run_dir.join(SNAPSHOT_ARTIFACT)).await
+                {
+                    emit_snapshot_warning(run_id, &cleanup_error);
+                }
+                emit_state_artifact_warning(run_id, &error);
+                None
+            }
+        }
+    }
+
+    async fn write_terminal_failure_snapshot(
+        &self,
+        run_id: &str,
+        error_class: &str,
+        uncertain_mutation: ProviderMutation,
+    ) -> Option<PathBuf> {
+        let submission_attempted = uncertain_mutation.may_have_started_server();
+        let artifact = StateArtifact {
+            provider: "pterodactyl",
+            workflow_stage: if submission_attempted {
+                "provider_submission_attempted"
+            } else {
+                "provider_failure"
+            },
+            current_state: None,
+            is_suspended: None,
+            is_limbo: None,
+            phase: None,
+            connection: None,
+            position: None,
+            total: None,
+            estimated_minutes: None,
+            blocked: None,
+            enabled: None,
+            wake_requested: false,
+            last_error: Some(error_class),
+            power_submission_state: None,
+            power_confirmation_source: None,
+        };
+        let snapshot_path = self.artifact_dir.join(run_id).join(SNAPSHOT_ARTIFACT);
+        if !self.artifact_capture.capture_failure_screenshot() {
+            if let Err(error) = remove_snapshot_artifact_async(snapshot_path).await {
+                emit_snapshot_warning(run_id, &error);
+            }
+            return None;
+        }
+        self.write_snapshot_artifact(run_id, &artifact).await
+    }
+
+    async fn write_snapshot_artifact(
+        &self,
+        run_id: &str,
+        artifact: &StateArtifact<'_>,
+    ) -> Option<PathBuf> {
+        let run_dir = self.artifact_dir.join(run_id);
+        let snapshot_path = run_dir.join(SNAPSHOT_ARTIFACT);
+        let render_run_id = run_id.to_string();
+        let view = snapshot::SnapshotView::from_artifact(artifact);
+        let write_run_dir = run_dir.clone();
+        let write_snapshot_path = snapshot_path.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            mark_run_artifact_dir(&write_run_dir)?;
+            let bytes = snapshot::render_snapshot_view(&render_run_id, &view)?;
+            remove_snapshot_artifact(&write_snapshot_path)?;
+            write_owner_only_atomic(&write_snapshot_path, &bytes)
+        })
+        .await
+        .context("provider snapshot artifact task failed")
+        .and_then(|result| result);
+        match result {
+            Ok(()) => Some(snapshot_path),
+            Err(error) => {
+                let _ = remove_snapshot_artifact_async(snapshot_path).await;
+                emit_snapshot_warning(run_id, &error);
                 None
             }
         }
@@ -1035,8 +1472,12 @@ impl ServerStartProvider for PterodactylProvider {
         "pterodactyl"
     }
 
+    fn check<'a>(&'a self, _run_id: &'a str) -> ProviderCheckFuture<'a> {
+        Box::pin(async move { self.check_inner().await })
+    }
+
     fn start<'a>(&'a self, run_id: &'a str) -> ProviderStartFuture<'a> {
-        Box::pin(async move { self.start_inner(run_id, None).await })
+        Box::pin(async move { self.start_with_terminal_artifacts(run_id, None).await })
     }
 
     fn start_with_progress<'a>(
@@ -1044,7 +1485,22 @@ impl ServerStartProvider for PterodactylProvider {
         run_id: &'a str,
         progress: ProviderProgressSender,
     ) -> ProviderStartFuture<'a> {
-        Box::pin(async move { self.start_inner(run_id, Some(&progress)).await })
+        Box::pin(async move {
+            self.start_with_terminal_artifacts(run_id, Some(&progress))
+                .await
+        })
+    }
+
+    fn submission_verified_artifact<'a>(
+        &'a self,
+        run_id: &'a str,
+        source: SubmissionVerificationSource,
+        observed_state: &'a str,
+    ) -> ProviderArtifactFuture<'a> {
+        Box::pin(async move {
+            self.write_verified_submission_artifact(run_id, source, observed_state)
+                .await
+        })
     }
 }
 
@@ -1074,6 +1530,25 @@ struct ServerEnvelope {
     attributes: PterodactylServer,
 }
 
+#[derive(Deserialize)]
+struct ActivityEnvelope {
+    data: Vec<ActivityItem>,
+}
+
+#[derive(Deserialize)]
+struct ActivityItem {
+    attributes: ServerActivity,
+}
+
+#[derive(Deserialize)]
+struct ServerActivity {
+    id: String,
+    event: String,
+    timestamp: String,
+    #[serde(default)]
+    is_api: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PlaySleepStatus {
     #[serde(alias = "status")]
@@ -1096,6 +1571,36 @@ struct AllocationResult {
     minecraft_address: Option<Arc<str>>,
     status: PlaySleepStatus,
     wake_requested: bool,
+}
+
+struct PowerConfirmation {
+    source: PowerConfirmationSource,
+    provider_state: Option<String>,
+    original_error: Option<String>,
+}
+
+impl PowerConfirmation {
+    fn accepted() -> Self {
+        Self {
+            source: PowerConfirmationSource::Response,
+            provider_state: None,
+            original_error: None,
+        }
+    }
+}
+
+struct PowerAttemptFailure {
+    failure: ProviderStartFailure,
+    last_provider_state: Option<String>,
+}
+
+impl PowerAttemptFailure {
+    fn new(failure: ProviderStartFailure) -> Self {
+        Self {
+            failure,
+            last_provider_state: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1171,9 +1676,41 @@ struct StateArtifact<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
     wake_requested: bool,
-    power_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power_submission_state: Option<PowerSubmissionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power_confirmation_source: Option<PowerConfirmationSource>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PowerSubmissionState {
+    Dispatching,
+    Ambiguous,
+    Confirmed,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PowerConfirmationSource {
+    Response,
+    Resources,
+    Activity,
+    ProviderVerification,
+    Minecraft,
+}
+
+struct PowerArtifactState<'a> {
+    current_state: &'a str,
+    is_suspended: bool,
+    is_limbo: bool,
+    submission_state: PowerSubmissionState,
+    allocation: Option<&'a AllocationResult>,
+    last_error: Option<&'a str>,
+    confirmation_source: Option<PowerConfirmationSource>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1216,6 +1753,18 @@ fn normalized_state(state: &str) -> String {
     match chars.next() {
         Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
         None => "Unknown".to_string(),
+    }
+}
+
+fn provider_check_result(
+    provider_status: impl Into<String>,
+    minecraft_address: Option<Arc<str>>,
+) -> ProviderCheckResult {
+    ProviderCheckResult {
+        provider_status: provider_status.into(),
+        minecraft_address,
+        screenshot_path: None,
+        detail_artifact_path: None,
     }
 }
 
@@ -1556,6 +2105,119 @@ fn classify_api_response(
     }
 }
 
+fn classify_power_request_error(error: &reqwest::Error) -> ProviderStartFailure {
+    if error.is_connect() {
+        let mut failure = provider_failure(
+            "ProviderPowerConnection",
+            "The power endpoint could not be reached before the request was submitted",
+            None,
+            ProviderMutation::None,
+        );
+        failure.retryable = true;
+        return failure;
+    }
+    if error.is_timeout() {
+        let mut failure = provider_failure(
+            "ProviderPowerTimeout",
+            "The power request timed out before the provider confirmed it",
+            None,
+            ProviderMutation::PowerStart,
+        );
+        failure.retryable = true;
+        return failure;
+    }
+
+    let mut failure = provider_failure(
+        "ProviderPowerAmbiguous",
+        "The power request connection ended before confirmation",
+        None,
+        ProviderMutation::PowerStart,
+    );
+    failure.retryable = true;
+    failure
+}
+
+fn power_response_failure_message(
+    status: StatusCode,
+    headers: &HeaderMap,
+    fallback: &str,
+) -> String {
+    let mut diagnostics = vec![format!("HTTP {}", status.as_u16())];
+    for name in ["cf-ray", "cf-mitigated", "server", "retry-after"] {
+        if let Some(value) = safe_diagnostic_header(headers, name) {
+            diagnostics.push(format!("{name}={value}"));
+        }
+    }
+    format!("{fallback} ({})", diagnostics.join(", "))
+}
+
+fn safe_diagnostic_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?;
+    let value = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '.' | ',' | ':' | '/' | ';' | '=' | '(' | ')' | '+' | '-' | '_'
+                )
+            {
+                character
+            } else {
+                '?'
+            }
+        })
+        .take(160)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
+}
+
+fn activity_confirms_power_start(
+    activity: &[ServerActivity],
+    baseline_id: Option<&str>,
+    attempted_at: DateTime<Utc>,
+) -> bool {
+    if let Some(baseline_id) = baseline_id
+        && let Some(position) = activity.iter().position(|item| item.id == baseline_id)
+    {
+        return activity[..position].iter().any(is_api_power_start_activity);
+    }
+
+    let latest_expected = Utc::now() + chrono::Duration::seconds(5);
+    activity.iter().any(|item| {
+        is_api_power_start_activity(item)
+            && DateTime::parse_from_rfc3339(&item.timestamp)
+                .map(|timestamp| {
+                    let timestamp = timestamp.with_timezone(&Utc);
+                    timestamp >= attempted_at && timestamp <= latest_expected
+                })
+                .unwrap_or(false)
+    })
+}
+
+fn is_api_power_start_activity(item: &ServerActivity) -> bool {
+    item.is_api && item.event == "server:power.start"
+}
+
+fn append_power_verification_detail(
+    message: &mut String,
+    last_provider_state: Option<&str>,
+    last_verification_error: Option<&str>,
+) {
+    if let Some(state) = last_provider_state {
+        message.push_str(&format!(
+            "; last provider state: {}",
+            terminal::clean(state)
+        ));
+    }
+    if let Some(error) = last_verification_error {
+        message.push_str(&format!(
+            "; last verification error: {}",
+            terminal::clean(error)
+        ));
+    }
+}
+
 fn is_cloudflare_challenge(headers: &HeaderMap, body: &[u8]) -> bool {
     if headers
         .get("cf-mitigated")
@@ -1624,6 +2286,97 @@ fn provider_failure(
     }
 }
 
+fn set_failure_artifacts(
+    failure: &mut ProviderStartFailure,
+    detail_artifact_path: Option<PathBuf>,
+    fresh_detail_artifact_path: Option<&PathBuf>,
+) {
+    failure.screenshot_path = snapshot_path_for_detail(fresh_detail_artifact_path);
+    failure.detail_artifact_path = detail_artifact_path;
+}
+
+fn backfill_failure_artifacts(
+    failure: &mut ProviderStartFailure,
+    fallback_detail_artifact_path: Option<PathBuf>,
+) {
+    if failure.detail_artifact_path.is_none() {
+        failure.detail_artifact_path = fallback_detail_artifact_path;
+    }
+}
+
+fn snapshot_path_for_detail(detail_artifact_path: Option<&PathBuf>) -> Option<PathBuf> {
+    let path = detail_artifact_path?.parent()?.join(SNAPSHOT_ARTIFACT);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    (metadata.file_type().is_file() && !metadata.file_type().is_symlink()).then_some(path)
+}
+
+fn remove_snapshot_artifact(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("snapshot path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn remove_snapshot_artifact_async(path: PathBuf) -> Result<()> {
+    tokio::task::spawn_blocking(move || remove_snapshot_artifact(&path))
+        .await
+        .context("provider snapshot cleanup task failed")?
+}
+
+fn emit_state_artifact_warning(run_id: &str, error: &anyhow::Error) {
+    terminal::emit(terminal::line(
+        "WARN",
+        "artifacts",
+        "",
+        "",
+        None,
+        format!(
+            "could not write sanitized provider state for run {}; error {}",
+            run_id,
+            terminal::clean(&error.to_string())
+        ),
+    ));
+}
+
+fn emit_snapshot_warning(run_id: &str, error: &anyhow::Error) {
+    terminal::emit(terminal::line(
+        "WARN",
+        "artifacts",
+        "",
+        "",
+        None,
+        format!(
+            "could not write provider snapshot for run {}; error {}",
+            run_id,
+            terminal::clean(&error.to_string())
+        ),
+    ));
+}
+
+fn should_capture_snapshot(
+    artifact_capture: ArtifactCapture,
+    artifact: &StateArtifact<'_>,
+) -> bool {
+    let failure = matches!(
+        artifact.power_submission_state,
+        Some(PowerSubmissionState::Ambiguous | PowerSubmissionState::Rejected)
+    ) || (artifact.last_error.is_some()
+        && !matches!(
+            artifact.power_submission_state,
+            Some(PowerSubmissionState::Confirmed)
+        ));
+    if failure {
+        artifact_capture.capture_failure_screenshot()
+    } else {
+        artifact_capture.capture_success_screenshot()
+    }
+}
+
 fn retryable_provider_failure(
     error_class: impl Into<String>,
     message: impl Into<String>,
@@ -1684,15 +2437,41 @@ mod tests {
     async fn mock_api(
         responses: Vec<(&'static str, StatusCode, &'static str)>,
     ) -> (Url, tokio::task::JoinHandle<()>) {
+        mock_api_with_delays(
+            responses
+                .into_iter()
+                .map(|(request, status, body)| (request, status, body, Duration::ZERO))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn mock_api_with_delays(
+        responses: Vec<(&'static str, StatusCode, &'static str, Duration)>,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            for (expected_request_line, status, body) in responses {
+            let mut responses = responses.into_iter().peekable();
+            while let Some((expected_request_line, _, _, _)) = responses.peek() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = vec![0; 8192];
                 let size = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..size]);
-                assert_eq!(request.lines().next(), Some(expected_request_line));
+                let request_line = request.lines().next().unwrap_or_default();
+                if request_line.contains("/activity?") && request_line != *expected_request_line {
+                    let body = r#"{"data":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    continue;
+                }
+                let (expected_request_line, status, body, delay) = responses.next().unwrap();
+                assert_eq!(request_line, expected_request_line);
+                sleep(delay).await;
 
                 let response = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1823,14 +2602,59 @@ mod tests {
 
         assert_eq!(result.outcome, StartOutcome::StartRequested);
         assert_eq!(result.minecraft_address.as_deref(), Some("server.example"));
+        let snapshot_path = result.screenshot_path.clone().expect("provider snapshot");
+        assert_eq!(
+            snapshot_path.file_name().and_then(|name| name.to_str()),
+            Some(SNAPSHOT_ARTIFACT)
+        );
+        let snapshot = image::open(&snapshot_path).unwrap();
+        assert_eq!(snapshot.width(), 1200);
+        assert_eq!(snapshot.height(), 675);
         let artifact =
             std::fs::read_to_string(result.detail_artifact_path.expect("state artifact")).unwrap();
         assert!(artifact.contains(r#""workflow_stage": "power_start""#));
         assert!(artifact.contains(r#""phase": "active""#));
         assert!(artifact.contains(r#""connection": "server.example""#));
-        assert!(artifact.contains(r#""power_requested": true"#));
+        assert!(artifact.contains(r#""current_state": "offline""#));
+        assert!(artifact.contains(r#""power_submission_state": "confirmed""#));
+        assert!(artifact.contains(r#""power_confirmation_source": "response""#));
         assert!(!artifact.contains("test-token"));
         server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn power_artifact_records_ambiguous_state_and_original_error() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-pterodactyl-ambiguous-power-{}",
+            rand::random::<u64>()
+        ));
+        let provider = test_provider(
+            test_config(Url::parse("http://127.0.0.1:1/").unwrap(), true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+
+        let path = provider
+            .write_power_state_artifact(
+                "run-id",
+                PowerArtifactState {
+                    current_state: "offline",
+                    is_suspended: false,
+                    is_limbo: true,
+                    submission_state: PowerSubmissionState::Ambiguous,
+                    allocation: None,
+                    last_error: Some("ProviderPowerTimeout: request timed out"),
+                    confirmation_source: None,
+                },
+            )
+            .await
+            .unwrap();
+        let artifact = std::fs::read_to_string(path).unwrap();
+
+        assert!(artifact.contains(r#""power_submission_state": "ambiguous""#));
+        assert!(artifact.contains("ProviderPowerTimeout"));
+        assert!(!artifact.contains("test-token"));
         std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
@@ -1968,11 +2792,6 @@ mod tests {
                 StatusCode::OK,
                 r#"{"phase":"queued","connection":null,"position":1,"total":4,"estimated_minutes":6,"enabled":true}"#,
             ),
-            (
-                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
-                StatusCode::OK,
-                r#"{"phase":"waking","connection":null,"position":1,"total":4,"estimated_minutes":6,"enabled":true}"#,
-            ),
         ])
         .await;
         let artifact_dir = std::env::temp_dir().join(format!(
@@ -1984,14 +2803,14 @@ mod tests {
             artifact_dir.clone(),
             ArtifactCapture::Screenshots,
         );
-        provider.allocation_wait_timeout = Duration::from_millis(5);
+        provider.allocation_wait_timeout = Duration::from_millis(1);
 
         let failure = provider.start_inner("run-id", None).await.unwrap_err();
 
         assert_eq!(failure.error_class, "ProviderAllocationTimeout");
         assert_eq!(failure.uncertain_mutation, ProviderMutation::WakeAllocation);
         assert!(!failure.uncertain_mutation.may_have_started_server());
-        assert!(failure.message.contains("phase waking"));
+        assert!(failure.message.contains("phase queued"));
         assert!(failure.message.contains("queue 1/4"));
         let artifact = std::fs::read_to_string(
             failure
@@ -2001,7 +2820,7 @@ mod tests {
         )
         .unwrap();
         assert!(artifact.contains(r#""workflow_stage": "allocation""#));
-        assert!(artifact.contains(r#""phase": "waking""#));
+        assert!(artifact.contains(r#""phase": "queued""#));
         assert!(artifact.contains(r#""position": 1"#));
         assert!(!artifact.contains("test-token"));
         assert!(!artifact.contains("cf_clearance"));
@@ -2040,6 +2859,115 @@ mod tests {
         let result = provider.start_inner("run-id", None).await.unwrap();
 
         assert_eq!(result.outcome, StartOutcome::AlreadyActive);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_check_reads_offline_state_without_power_request() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":false,"status":"offline"}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.check("check1").await.unwrap();
+
+        assert_eq!(result.provider_status, "Offline");
+        assert_eq!(result.minecraft_address, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_check_reads_limbo_queue_without_wake_request() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":true,"status":"suspended"}}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","position":3,"total":8}"#,
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.check("check1").await.unwrap();
+
+        assert_eq!(result.provider_status, "Allocation queued");
+        assert_eq!(result.minecraft_address, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_check_reports_non_limbo_suspension_without_resource_request() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":false,"status":"suspended"}}"#;
+        let (panel_origin, server) = mock_api(vec![(
+            "GET /api/client/servers/34634dd7 HTTP/1.1",
+            StatusCode::OK,
+            details,
+        )])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.check("check1").await.unwrap();
+
+        assert_eq!(result.provider_status, "Suspended");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_check_reports_suspended_resource_state() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":false,"status":"offline"}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":true}}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.check("check1").await.unwrap();
+
+        assert_eq!(result.provider_status, "Suspended");
         server.await.unwrap();
     }
 
@@ -2199,16 +3127,134 @@ mod tests {
             ),
         ])
         .await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-pterodactyl-resource-confirmed-{}",
+            rand::random::<u64>()
+        ));
         let provider = test_provider(
             test_config(panel_origin, true),
-            PathBuf::from("unused"),
-            ArtifactCapture::Off,
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
         );
 
         let result = provider.start_inner("run-id", None).await.unwrap();
 
         assert_eq!(result.outcome, StartOutcome::StartRequested);
+        let artifact =
+            std::fs::read_to_string(result.detail_artifact_path.expect("state artifact")).unwrap();
+        assert!(artifact.contains(r#""current_state": "starting""#));
+        assert!(artifact.contains(r#""power_submission_state": "confirmed""#));
+        assert!(artifact.contains(r#""power_confirmation_source": "resources""#));
+        assert!(artifact.contains("HTTP 502"));
+        assert!(!artifact.contains("test-token"));
         server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_baseline_timeout_does_not_block_single_power_request() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":false,"status":"offline"}}"#;
+        let offline = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server) = mock_api_with_delays(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                offline,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/activity?sort=-timestamp&filter%5Bevent%5D=server%3Apower.start HTTP/1.1",
+                StatusCode::OK,
+                r#"{"data":[]}"#,
+                Duration::from_millis(50),
+            ),
+            (
+                "POST /api/client/servers/34634dd7/power HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+        provider.submission_probe_timeout = Duration::from_millis(10);
+
+        let result = provider.start_inner("run-id", None).await.unwrap();
+
+        assert_eq!(result.outcome, StartOutcome::StartRequested);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_power_uses_recent_api_activity_without_replaying_post() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":false,"status":"offline"}}"#;
+        let offline = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let baseline = r#"{"data":[{"attributes":{"id":"baseline","event":"server:power.start","timestamp":"2000-01-01T00:00:00Z","is_api":true}}]}"#;
+        let activity = r#"{"data":[{"attributes":{"id":"new-start","event":"server:power.start","timestamp":"2000-01-01T00:00:01Z","is_api":true}},{"attributes":{"id":"baseline","event":"server:power.start","timestamp":"2000-01-01T00:00:00Z","is_api":true}}]}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                offline,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/activity?sort=-timestamp&filter%5Bevent%5D=server%3Apower.start HTTP/1.1",
+                StatusCode::OK,
+                baseline,
+            ),
+            (
+                "POST /api/client/servers/34634dd7/power HTTP/1.1",
+                StatusCode::BAD_GATEWAY,
+                "{}",
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                offline,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/activity?sort=-timestamp&filter%5Bevent%5D=server%3Apower.start HTTP/1.1",
+                StatusCode::OK,
+                activity,
+            ),
+        ])
+        .await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-pterodactyl-activity-confirmed-{}",
+            rand::random::<u64>()
+        ));
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+
+        let result = provider.start_inner("run-id", None).await.unwrap();
+
+        assert_eq!(result.outcome, StartOutcome::StartRequested);
+        let artifact =
+            std::fs::read_to_string(result.detail_artifact_path.expect("state artifact")).unwrap();
+        assert!(artifact.contains(r#""current_state": "offline""#));
+        assert!(artifact.contains(r#""power_submission_state": "confirmed""#));
+        assert!(artifact.contains(r#""power_confirmation_source": "activity""#));
+        assert!(artifact.contains("HTTP 502"));
+        server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2422,6 +3468,297 @@ mod tests {
         );
         assert!(read_retry.retryable);
         assert_eq!(read_retry.uncertain_mutation, ProviderMutation::None);
+    }
+
+    #[tokio::test]
+    async fn connection_failures_are_definitively_pre_submission() {
+        let error = Client::new()
+            .post("http://127.0.0.1:0/power")
+            .send()
+            .await
+            .unwrap_err();
+
+        let failure = classify_power_request_error(&error);
+
+        assert_eq!(failure.error_class, "ProviderPowerConnection");
+        assert_eq!(failure.uncertain_mutation, ProviderMutation::None);
+    }
+
+    #[tokio::test]
+    async fn response_timeouts_remain_ambiguous() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            sleep(Duration::from_millis(100)).await;
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_millis(10))
+            .build()
+            .unwrap();
+        let error = client
+            .post(format!("http://{address}/power"))
+            .send()
+            .await
+            .unwrap_err();
+
+        let failure = classify_power_request_error(&error);
+
+        assert_eq!(failure.error_class, "ProviderPowerTimeout");
+        assert_eq!(failure.uncertain_mutation, ProviderMutation::PowerStart);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn activity_confirmation_requires_recent_api_power_start() {
+        let attempted_at = Utc::now() - chrono::Duration::seconds(2);
+        let recent = (attempted_at + chrono::Duration::seconds(1)).to_rfc3339();
+        let old = (attempted_at - chrono::Duration::seconds(1)).to_rfc3339();
+        let activity = |id: &str, event: &str, timestamp: &str, is_api: bool| ServerActivity {
+            id: id.to_string(),
+            event: event.to_string(),
+            timestamp: timestamp.to_string(),
+            is_api,
+        };
+
+        assert!(activity_confirms_power_start(
+            &[activity("new", "server:power.start", &recent, true,)],
+            None,
+            attempted_at,
+        ));
+        assert!(!activity_confirms_power_start(
+            &[activity("old", "server:power.start", &old, true,)],
+            None,
+            attempted_at,
+        ));
+        assert!(!activity_confirms_power_start(
+            &[activity("new", "server:power.start", &recent, false,)],
+            None,
+            attempted_at,
+        ));
+        assert!(!activity_confirms_power_start(
+            &[activity(
+                "future",
+                "server:power.start",
+                "9999-01-01T00:00:00+00:00",
+                true,
+            )],
+            None,
+            attempted_at,
+        ));
+        assert!(activity_confirms_power_start(
+            &[
+                activity(
+                    "new",
+                    "server:power.start",
+                    "2000-01-01T00:00:00+00:00",
+                    true,
+                ),
+                activity(
+                    "baseline",
+                    "server:power.start",
+                    "1999-01-01T00:00:00+00:00",
+                    true,
+                ),
+            ],
+            Some("baseline"),
+            attempted_at,
+        ));
+    }
+
+    #[test]
+    fn power_response_diagnostics_include_only_safe_selected_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", HeaderValue::from_static("abc123"));
+        headers.insert("server", HeaderValue::from_static("@everyone `unsafe`"));
+        headers.insert("set-cookie", HeaderValue::from_static("secret=value"));
+
+        let message =
+            power_response_failure_message(StatusCode::BAD_GATEWAY, &headers, "server error");
+
+        assert!(message.contains("HTTP 502"));
+        assert!(message.contains("cf-ray=abc123"));
+        assert!(!message.contains('@'));
+        assert!(!message.contains('`'));
+        assert!(!message.contains("secret"));
+    }
+
+    #[test]
+    fn snapshot_capture_policy_distinguishes_success_and_failure() {
+        let mut artifact = StateArtifact {
+            provider: "pterodactyl",
+            workflow_stage: "power_start",
+            current_state: Some("offline"),
+            is_suspended: Some(false),
+            is_limbo: Some(true),
+            phase: Some("active"),
+            connection: Some("server.example"),
+            position: None,
+            total: None,
+            estimated_minutes: None,
+            blocked: Some(false),
+            enabled: Some(true),
+            wake_requested: true,
+            last_error: None,
+            power_submission_state: Some(PowerSubmissionState::Confirmed),
+            power_confirmation_source: Some(PowerConfirmationSource::Response),
+        };
+
+        assert!(should_capture_snapshot(
+            ArtifactCapture::Screenshots,
+            &artifact
+        ));
+        assert!(!should_capture_snapshot(
+            ArtifactCapture::Failure,
+            &artifact
+        ));
+        assert!(!should_capture_snapshot(ArtifactCapture::Off, &artifact));
+
+        artifact.last_error = Some("ProviderPowerTimeout");
+        assert!(!should_capture_snapshot(
+            ArtifactCapture::Failure,
+            &artifact
+        ));
+
+        artifact.power_submission_state = Some(PowerSubmissionState::Rejected);
+        artifact.last_error = Some("ProviderPowerRejected");
+        assert!(should_capture_snapshot(ArtifactCapture::Failure, &artifact));
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_failure_has_valid_snapshot() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":false,"status":"suspended"}}"#;
+        let (panel_origin, server) = mock_api(vec![(
+            "GET /api/client/servers/34634dd7 HTTP/1.1",
+            StatusCode::OK,
+            details,
+        )])
+        .await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-provider-failure-snapshot-{}",
+            rand::random::<u64>()
+        ));
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Failure,
+        );
+
+        let failure = provider
+            .start_with_terminal_artifacts("run-id", None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderSuspended");
+        let snapshot = failure.screenshot_path.expect("failure snapshot");
+        let image = image::open(snapshot).unwrap();
+        assert_eq!((image.width(), image.height()), (1200, 675));
+        server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_capture_modes_remove_stale_images() {
+        let artifact = StateArtifact {
+            provider: "pterodactyl",
+            workflow_stage: "provider_state",
+            current_state: Some("running"),
+            is_suspended: Some(false),
+            is_limbo: Some(false),
+            phase: None,
+            connection: None,
+            position: None,
+            total: None,
+            estimated_minutes: None,
+            blocked: None,
+            enabled: None,
+            wake_requested: false,
+            last_error: None,
+            power_submission_state: None,
+            power_confirmation_source: None,
+        };
+
+        for (capture, expected) in [
+            (ArtifactCapture::Screenshots, true),
+            (ArtifactCapture::Full, true),
+            (ArtifactCapture::Failure, false),
+            (ArtifactCapture::Off, false),
+        ] {
+            let artifact_dir = std::env::temp_dir().join(format!(
+                "butler-provider-capture-mode-{}",
+                rand::random::<u64>()
+            ));
+            let provider = test_provider(
+                test_config(Url::parse("http://127.0.0.1:1/").unwrap(), true),
+                artifact_dir.clone(),
+                capture,
+            );
+            let run_dir = artifact_dir.join("run-id");
+            mark_run_artifact_dir(&run_dir).unwrap();
+            std::fs::write(run_dir.join(SNAPSHOT_ARTIFACT), b"stale").unwrap();
+
+            let detail = provider
+                .write_state_artifact_value("run-id", &artifact)
+                .await;
+            let snapshot = run_dir.join(SNAPSHOT_ARTIFACT);
+
+            assert_eq!(detail.is_some(), capture != ArtifactCapture::Off);
+            assert_eq!(snapshot.is_file(), expected);
+            if expected {
+                let image = image::open(&snapshot).unwrap();
+                assert_eq!((image.width(), image.height()), (1200, 675));
+            }
+            std::fs::remove_dir_all(artifact_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_verification_replaces_attempted_snapshot_with_confirmed_state() {
+        for (capture, expected_snapshot) in [
+            (ArtifactCapture::Screenshots, true),
+            (ArtifactCapture::Failure, false),
+        ] {
+            let artifact_dir = std::env::temp_dir().join(format!(
+                "butler-provider-service-verification-{}",
+                rand::random::<u64>()
+            ));
+            let provider = test_provider(
+                test_config(Url::parse("http://127.0.0.1:1/").unwrap(), true),
+                artifact_dir.clone(),
+                capture,
+            );
+            let attempted = provider
+                .write_terminal_failure_snapshot(
+                    "run-id",
+                    "ProviderPowerTimeout",
+                    ProviderMutation::PowerStart,
+                )
+                .await;
+            assert!(attempted.is_some());
+
+            let confirmed = provider
+                .write_verified_submission_artifact(
+                    "run-id",
+                    SubmissionVerificationSource::Minecraft,
+                    "online",
+                )
+                .await;
+            assert_eq!(confirmed.is_some(), expected_snapshot);
+            assert_eq!(
+                artifact_dir
+                    .join("run-id")
+                    .join(SNAPSHOT_ARTIFACT)
+                    .is_file(),
+                expected_snapshot
+            );
+            let detail =
+                std::fs::read_to_string(artifact_dir.join("run-id").join(STATE_ARTIFACT)).unwrap();
+            assert!(detail.contains(r#""workflow_stage": "submission_verified""#));
+            assert!(detail.contains(r#""current_state": "online""#));
+            assert!(detail.contains(r#""power_submission_state": "confirmed""#));
+            assert!(detail.contains(r#""power_confirmation_source": "minecraft""#));
+            std::fs::remove_dir_all(artifact_dir).unwrap();
+        }
     }
 
     #[test]

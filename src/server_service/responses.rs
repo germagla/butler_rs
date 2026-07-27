@@ -74,7 +74,8 @@ pub(super) async fn edit_start_message(
             message.message_id,
             serenity::EditMessage::new()
                 .content(content)
-                .allowed_mentions(disabled_mentions()),
+                .allowed_mentions(disabled_mentions())
+                .attachments(serenity::EditAttachments::new()),
         )
         .await
     {

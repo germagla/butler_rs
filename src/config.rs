@@ -100,7 +100,18 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let discord_token = required_var("DISCORD_TOKEN")?;
+        Self::from_env_inner(true)
+    }
+
+    pub fn from_provider_env() -> Result<Self> {
+        Self::from_env_inner(false)
+    }
+
+    fn from_env_inner(require_discord_token: bool) -> Result<Self> {
+        let discord_token = discord_token_value(
+            env::var("DISCORD_TOKEN").ok().as_deref(),
+            require_discord_token,
+        )?;
         let provider_kind = provider_kind_var("SERVER_PROVIDER")?;
         let provider = match provider_kind {
             ServerProviderKind::Aternos => ProviderConfig::Aternos(AternosConfig {
@@ -138,12 +149,29 @@ impl Config {
         let minecraft_server_addr =
             env::var("MINECRAFT_SERVER_ADDR").unwrap_or_else(|_| "localhost:25565".to_string());
         bool_var("BUTLER_COLOR", true)?;
+        let (
+            start_wait_online_secs,
+            attach_screenshots,
+            persist_run_events,
+            redact_run_events,
+            owner_user_ids,
+        ) = if require_discord_token {
+            (
+                bounded_positive_u64_var("START_WAIT_ONLINE_SECS", 600, 3_600)?,
+                bool_var("BUTLER_ATTACH_SCREENSHOTS", true)?,
+                bool_var("BUTLER_PERSIST_RUN_EVENTS", true)?,
+                bool_var("BUTLER_REDACT_RUN_EVENTS", true)?,
+                owner_user_ids_var("BUTLER_OWNER_IDS")?,
+            )
+        } else {
+            (600, false, false, true, HashSet::new())
+        };
 
         Ok(Self {
             discord_token,
             provider,
             minecraft_server_addr,
-            start_wait_online_secs: bounded_positive_u64_var("START_WAIT_ONLINE_SECS", 600, 3_600)?,
+            start_wait_online_secs,
             run_history_limit: usize_var("RUN_HISTORY_LIMIT", 20)?,
             artifact_dir: PathBuf::from(
                 env::var("ARTIFACT_DIR").unwrap_or_else(|_| "artifacts/runs".to_string()),
@@ -152,12 +180,20 @@ impl Config {
                 "ARTIFACT_CAPTURE",
                 ArtifactCapture::Screenshots,
             )?,
-            attach_screenshots: bool_var("BUTLER_ATTACH_SCREENSHOTS", true)?,
-            persist_run_events: bool_var("BUTLER_PERSIST_RUN_EVENTS", true)?,
-            redact_run_events: bool_var("BUTLER_REDACT_RUN_EVENTS", true)?,
-            owner_user_ids: owner_user_ids_var("BUTLER_OWNER_IDS")?,
+            attach_screenshots,
+            persist_run_events,
+            redact_run_events,
+            owner_user_ids,
         })
     }
+}
+
+fn discord_token_value(value: Option<&str>, required: bool) -> Result<String> {
+    let value = value.unwrap_or_default().trim();
+    if required && value.is_empty() {
+        bail!("DISCORD_TOKEN must be set and must not be empty");
+    }
+    Ok(value.to_string())
 }
 
 fn required_var(name: &str) -> Result<String> {
@@ -422,6 +458,15 @@ mod tests {
     fn screenshot_attachment_default_is_enabled() {
         assert!(parse_bool_value(None, true).unwrap());
         assert!(!parse_bool_value(Some("false"), true).unwrap());
+    }
+
+    #[test]
+    fn provider_only_config_does_not_require_discord_token() {
+        assert_eq!(discord_token_value(None, false).unwrap(), "");
+        assert_eq!(discord_token_value(Some(""), false).unwrap(), "");
+        assert!(discord_token_value(None, true).is_err());
+        assert!(discord_token_value(Some("  "), true).is_err());
+        assert_eq!(discord_token_value(Some(" token "), true).unwrap(), "token");
     }
 
     #[test]

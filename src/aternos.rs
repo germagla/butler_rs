@@ -1,8 +1,8 @@
 use crate::{
     config::{ArtifactCapture, AternosConfig},
     provider::{
-        ProviderMutation, ProviderStartFailure, ProviderStartFuture, ProviderStartResult,
-        ServerStartProvider, StartOutcome,
+        ProviderCheckFuture, ProviderCheckResult, ProviderMutation, ProviderStartFailure,
+        ProviderStartFuture, ProviderStartResult, ServerStartProvider, StartOutcome,
     },
     run_history::{ensure_owner_only_file, mark_run_artifact_dir},
     terminal,
@@ -30,6 +30,8 @@ const DASHBOARD_SUCCESS_HTML: &str = "dashboard_after_start.html";
 const DASHBOARD_BEFORE_START_SCREENSHOT: &str = "dashboard_before_start.png";
 const FAILURE_SCREENSHOT: &str = "failure.png";
 const FAILURE_HTML: &str = "failure.html";
+const CHECK_SCREENSHOT: &str = "provider_check.png";
+const CHECK_HTML: &str = "provider_check.html";
 const BROWSER_WINDOW_SIZE: &str = "--window-size=1920,1080";
 const BROWSER_USER_AGENT: &str = "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const BROWSER_START_ATTEMPTS: usize = 2;
@@ -79,6 +81,40 @@ impl ServerStartProvider for BrowserAternosProvider {
         "aternos"
     }
 
+    fn check<'a>(&'a self, run_id: &'a str) -> ProviderCheckFuture<'a> {
+        Box::pin(async move {
+            let username = self.config.user.clone();
+            let password = self.config.password.clone();
+            let server_id = self.config.server_id.clone();
+            let headless = self.config.headless;
+            let chrome_path = self.config.chrome_path.clone();
+            let run_dir = self.artifact_dir.join(run_id);
+            let artifact_capture = self.artifact_capture;
+
+            tokio::task::spawn_blocking(move || {
+                run_browser_check(
+                    username,
+                    password,
+                    server_id,
+                    headless,
+                    chrome_path,
+                    run_dir,
+                    artifact_capture,
+                )
+            })
+            .await
+            .map_err(|error| ProviderStartFailure {
+                error_class: "BrowserThreadJoin".to_string(),
+                message: error.to_string(),
+                screenshot_path: None,
+                detail_artifact_path: None,
+                minecraft_address: None,
+                uncertain_mutation: ProviderMutation::None,
+                retryable: false,
+            })?
+        })
+    }
+
     fn start<'a>(&'a self, run_id: &'a str) -> ProviderStartFuture<'a> {
         Box::pin(async move {
             let username = self.config.user.clone();
@@ -111,6 +147,123 @@ impl ServerStartProvider for BrowserAternosProvider {
                 retryable: false,
             })?
         })
+    }
+}
+
+fn run_browser_check(
+    username: String,
+    password: String,
+    server_id: Option<String>,
+    headless: bool,
+    chrome_path: Option<PathBuf>,
+    run_dir: PathBuf,
+    artifact_capture: ArtifactCapture,
+) -> Result<ProviderCheckResult, ProviderStartFailure> {
+    let context = BrowserStartContext {
+        username: &username,
+        password: &password,
+        server_id: server_id.as_deref(),
+        headless,
+        chrome_path: chrome_path.as_deref(),
+        run_dir: &run_dir,
+        artifact_capture,
+    };
+    run_with_browser_disconnect_retry(
+        |capture_retryable_failure_artifacts| {
+            run_browser_check_once(&context, capture_retryable_failure_artifacts)
+        },
+        BROWSER_START_ATTEMPTS,
+        |attempt, failure| emit_browser_retry_warning(&run_dir, attempt, failure),
+    )
+}
+
+fn run_browser_check_once(
+    context: &BrowserStartContext<'_>,
+    capture_retryable_failure_artifacts: bool,
+) -> Result<ProviderCheckResult, ProviderStartFailure> {
+    let args = vec![
+        OsStr::new("--disable-blink-features=AutomationControlled"),
+        OsStr::new("--disable-notifications"),
+        OsStr::new(BROWSER_WINDOW_SIZE),
+        OsStr::new(BROWSER_USER_AGENT),
+    ];
+    let options = LaunchOptions {
+        headless: context.headless,
+        path: context.chrome_path.map(Path::to_path_buf),
+        args,
+        ignore_certificate_errors: false,
+        process_envs: Some(HashMap::from([
+            ("DISCORD_TOKEN".to_string(), String::new()),
+            ("ATERNOS_USER".to_string(), String::new()),
+            ("ATERNOS_PASS".to_string(), String::new()),
+            ("PTERODACTYL_API_TOKEN".to_string(), String::new()),
+        ])),
+        ..Default::default()
+    };
+    let browser = Browser::new(options).map_err(|error| ProviderStartFailure {
+        error_class: browser_setup_error_class(&error.to_string(), "BrowserLaunch"),
+        message: error.to_string(),
+        screenshot_path: None,
+        detail_artifact_path: None,
+        minecraft_address: None,
+        uncertain_mutation: ProviderMutation::None,
+        retryable: false,
+    })?;
+    let tab = browser.new_tab().map_err(|error| ProviderStartFailure {
+        error_class: browser_setup_error_class(&error.to_string(), "BrowserTab"),
+        message: error.to_string(),
+        screenshot_path: None,
+        detail_artifact_path: None,
+        minecraft_address: None,
+        uncertain_mutation: ProviderMutation::None,
+        retryable: false,
+    })?;
+
+    match open_authenticated_dashboard(&tab, context.username, context.password, context.server_id)
+        .and_then(|()| dashboard_status(&tab))
+    {
+        Ok(provider_status) => Ok(ProviderCheckResult {
+            provider_status,
+            minecraft_address: None,
+            screenshot_path: capture_screenshot_best_effort(
+                &tab,
+                context.run_dir,
+                CHECK_SCREENSHOT,
+                context.artifact_capture.capture_success_screenshot(),
+            ),
+            detail_artifact_path: capture_html_best_effort(
+                &tab,
+                context.run_dir,
+                CHECK_HTML,
+                context.artifact_capture.capture_success_html(),
+            ),
+        }),
+        Err(error) => {
+            let mut failure = ProviderStartFailure {
+                error_class: classify_browser_error(&error),
+                message: browser_failure_message(&error),
+                screenshot_path: None,
+                detail_artifact_path: None,
+                minecraft_address: None,
+                uncertain_mutation: ProviderMutation::None,
+                retryable: false,
+            };
+            if !is_retryable_browser_failure(&failure) || capture_retryable_failure_artifacts {
+                failure.screenshot_path = capture_screenshot_best_effort(
+                    &tab,
+                    context.run_dir,
+                    FAILURE_SCREENSHOT,
+                    context.artifact_capture.capture_failure_screenshot(),
+                );
+                failure.detail_artifact_path = capture_html_best_effort(
+                    &tab,
+                    context.run_dir,
+                    FAILURE_HTML,
+                    context.artifact_capture.capture_failure_html(),
+                );
+            }
+            Err(failure)
+        }
     }
 }
 
@@ -264,56 +417,9 @@ fn run_dashboard_flow(
         };
     }
 
-    try_flow!(
-        tab.navigate_to(ATERNOS_LOGIN_URL)
-            .context("LoginPageUnavailable: could not open the Aternos login page")
-    );
-    random_delay();
-    sleep(Duration::from_secs(PAGE_SETTLE_SECS));
-    try_flow!(click_cookie_consent(tab));
-    try_flow!(dismiss_notification_prompt(tab));
-    try_flow!(dismiss_page_blockers(tab));
-    random_delay();
-    try_flow!(fail_if_challenge_present(tab));
-
-    let user_field = try_flow!(wait_for_browser_element(
-        tab,
-        USERNAME_SELECTOR,
-        "LoginFormUnavailable",
-        "username field was not available",
+    try_flow!(open_authenticated_dashboard(
+        tab, username, password, server_id
     ));
-    random_delay();
-    try_flow!(user_field.click());
-    random_delay();
-    try_flow!(user_field.type_into(username));
-    random_delay();
-
-    let pass_field = try_flow!(wait_for_browser_element(
-        tab,
-        PASSWORD_SELECTOR,
-        "LoginFormUnavailable",
-        "password field was not available",
-    ));
-    try_flow!(pass_field.click());
-    random_delay();
-    try_flow!(pass_field.type_into(password));
-    random_delay();
-
-    let login_button = try_flow!(wait_for_browser_element(
-        tab,
-        LOGIN_BUTTON_SELECTOR,
-        "LoginFormUnavailable",
-        "login button was not available",
-    ));
-    try_flow!(login_button.click());
-    random_delay();
-    try_flow!(dismiss_page_blockers(tab));
-    try_flow!(fail_if_challenge_present(tab));
-
-    try_flow!(open_server_dashboard(tab, server_id));
-    try_flow!(dismiss_notification_prompt(tab));
-    try_flow!(dismiss_page_blockers(tab));
-    try_flow!(fail_if_challenge_present(tab));
 
     let mut dashboard_status = try_flow!(dashboard_status(tab));
     let mut accepted = false;
@@ -329,7 +435,7 @@ fn run_dashboard_flow(
             break;
         }
 
-        if state.start_button_visible {
+        if should_click_start(start_clicked, &state) {
             try_flow!(scroll_start_into_view(tab));
             sleep(Duration::from_millis(START_CLICK_SETTLE_MS));
             if let Ok(button) = tab.find_element(START_BUTTON_SELECTOR) {
@@ -428,6 +534,62 @@ fn run_dashboard_flow(
     })
 }
 
+fn open_authenticated_dashboard(
+    tab: &headless_chrome::Tab,
+    username: &str,
+    password: &str,
+    server_id: Option<&str>,
+) -> Result<()> {
+    tab.navigate_to(ATERNOS_LOGIN_URL)
+        .context("LoginPageUnavailable: could not open the Aternos login page")?;
+    random_delay();
+    sleep(Duration::from_secs(PAGE_SETTLE_SECS));
+    click_cookie_consent(tab)?;
+    dismiss_notification_prompt(tab)?;
+    dismiss_page_blockers(tab)?;
+    random_delay();
+    fail_if_challenge_present(tab)?;
+
+    let user_field = wait_for_browser_element(
+        tab,
+        USERNAME_SELECTOR,
+        "LoginFormUnavailable",
+        "username field was not available",
+    )?;
+    random_delay();
+    user_field.click()?;
+    random_delay();
+    user_field.type_into(username)?;
+    random_delay();
+
+    let pass_field = wait_for_browser_element(
+        tab,
+        PASSWORD_SELECTOR,
+        "LoginFormUnavailable",
+        "password field was not available",
+    )?;
+    pass_field.click()?;
+    random_delay();
+    pass_field.type_into(password)?;
+    random_delay();
+
+    let login_button = wait_for_browser_element(
+        tab,
+        LOGIN_BUTTON_SELECTOR,
+        "LoginFormUnavailable",
+        "login button was not available",
+    )?;
+    login_button.click()?;
+    random_delay();
+    dismiss_page_blockers(tab)?;
+    fail_if_challenge_present(tab)?;
+
+    open_server_dashboard(tab, server_id)?;
+    dismiss_notification_prompt(tab)?;
+    dismiss_page_blockers(tab)?;
+    fail_if_challenge_present(tab)
+}
+
 #[derive(Debug)]
 struct BrowserFlowFailure {
     error: anyhow::Error,
@@ -448,6 +610,10 @@ fn dashboard_state_from_parts(status: &str, start_button_visible: bool) -> Dashb
         start_button_visible,
         accepted: status != "unknown" && (!status.contains("Offline") || !start_button_visible),
     }
+}
+
+fn should_click_start(start_clicked: bool, state: &DashboardState) -> bool {
+    !start_clicked && state.start_button_visible && !state.accepted
 }
 
 fn dashboard_state(tab: &headless_chrome::Tab) -> Result<DashboardState> {
@@ -1487,13 +1653,13 @@ fn artifact_warning_error_class(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn run_with_browser_disconnect_retry<F, W>(
+fn run_with_browser_disconnect_retry<T, F, W>(
     mut run_once: F,
     max_attempts: usize,
     mut warn_retry: W,
-) -> Result<ProviderStartResult, ProviderStartFailure>
+) -> Result<T, ProviderStartFailure>
 where
-    F: FnMut(bool) -> Result<ProviderStartResult, ProviderStartFailure>,
+    F: FnMut(bool) -> Result<T, ProviderStartFailure>,
     W: FnMut(usize, &ProviderStartFailure),
 {
     let max_attempts = max_attempts.max(1);
@@ -1720,6 +1886,16 @@ mod tests {
 
         let offline_visible = dashboard_state_from_parts("Offline", true);
         assert!(!offline_visible.accepted);
+    }
+
+    #[test]
+    fn start_button_is_clicked_at_most_once() {
+        let offline = dashboard_state_from_parts("Offline", true);
+        assert!(should_click_start(false, &offline));
+        assert!(!should_click_start(true, &offline));
+
+        let starting = dashboard_state_from_parts("Starting", false);
+        assert!(!should_click_start(false, &starting));
     }
 
     #[test]
@@ -2029,7 +2205,8 @@ mod tests {
 
     #[test]
     fn browser_disconnect_retry_exhaustion_is_classified() {
-        let mut attempts = VecDeque::new();
+        let mut attempts: VecDeque<Result<ProviderStartResult, ProviderStartFailure>> =
+            VecDeque::new();
         attempts.push_back(Err(provider_failure(
             "BrowserAutomation",
             "Unable to make method calls because underlying connection is closed",
@@ -2072,7 +2249,7 @@ mod tests {
             let result = run_with_browser_disconnect_retry(
                 |_| {
                     calls += 1;
-                    Err(failure.clone())
+                    Err::<ProviderStartResult, _>(failure.clone())
                 },
                 2,
                 |_, _| panic!("unexpected retry for {error_class}"),
@@ -2091,7 +2268,7 @@ mod tests {
         let failure = run_with_browser_disconnect_retry(
             |final_attempt| {
                 final_attempts.push(final_attempt);
-                Err(provider_failure(
+                Err::<ProviderStartResult, _>(provider_failure(
                     "BrowserConnectionClosed",
                     "Unable to make method calls because underlying connection is closed",
                 ))

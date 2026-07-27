@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -182,6 +182,7 @@ impl RunStore {
         artifact_dir: &Path,
         limit: usize,
         rotate_unredacted_events: bool,
+        prune_artifacts: bool,
     ) -> Result<Option<EventFileMaintenance>> {
         harden_existing_artifact_permissions(artifact_dir)?;
         let rotated = if rotate_unredacted_events {
@@ -189,7 +190,9 @@ impl RunStore {
         } else {
             None
         };
-        prune_run_artifact_dirs(artifact_dir, limit)?;
+        if prune_artifacts {
+            prune_run_artifact_dirs(artifact_dir, limit)?;
+        }
         Ok(rotated)
     }
 
@@ -227,16 +230,43 @@ pub fn now_ms() -> u128 {
 }
 
 pub fn mark_run_artifact_dir(run_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(run_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("ArtifactWrite: run artifact path is not a safe directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("ArtifactWrite: could not inspect run directory"),
+    }
     ensure_owner_only_dir(run_dir)?;
     let marker = run_dir.join(RUN_DIR_MARKER);
-    fs::write(&marker, "butler-run\n").with_context(|| {
-        format!(
-            "ArtifactWrite: could not write marker in {}",
-            run_dir.display()
-        )
-    })?;
-    ensure_owner_only_file(&marker)?;
-    Ok(())
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            if fs::read_to_string(&marker).ok().as_deref() != Some("butler-run\n") {
+                bail!("ArtifactWrite: existing run marker was invalid");
+            }
+            ensure_owner_only_file(&marker)?;
+            return Ok(());
+        }
+        Ok(_) => bail!("ArtifactWrite: run marker is not a safe regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("ArtifactWrite: could not inspect run marker"),
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let result = (|| {
+        let mut file = options.open(&marker).with_context(|| {
+            format!(
+                "ArtifactWrite: could not write marker in {}",
+                run_dir.display()
+            )
+        })?;
+        file.write_all(b"butler-run\n")?;
+        file.sync_all()?;
+        ensure_owner_only_file(&marker)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&marker);
+    }
+    result
 }
 
 pub fn verify_artifact_dir_writable(artifact_dir: &Path) -> Result<()> {
@@ -318,6 +348,63 @@ pub fn ensure_owner_only_dir(path: &Path) -> Result<()> {
 
 pub fn ensure_owner_only_file(path: &Path) -> Result<()> {
     set_owner_only_mode(path, false)
+}
+
+pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("ArtifactWrite: artifact path has no parent directory")?;
+    ensure_owner_only_dir(parent)?;
+
+    for attempt in 0..16 {
+        let temp_path = parent.join(format!(
+            ".butler-write-{}-{}-{}-{attempt}",
+            std::process::id(),
+            now_ms(),
+            rand::random::<u64>()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "ArtifactWrite: could not create temporary file in {}",
+                        parent.display()
+                    )
+                });
+            }
+        };
+
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)?;
+            ensure_owner_only_file(path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return result.with_context(|| {
+            format!(
+                "ArtifactWrite: could not atomically write {}",
+                path.display()
+            )
+        });
+    }
+
+    bail!(
+        "ArtifactWrite: could not create a unique temporary file in {}",
+        parent.display()
+    )
 }
 
 fn harden_existing_artifact_permissions(artifact_dir: &Path) -> Result<()> {
@@ -481,7 +568,12 @@ fn prune_run_artifact_dir_paths(
 }
 
 fn is_butler_run_artifact_dir(path: &Path) -> bool {
-    if path.join(RUN_DIR_MARKER).is_file() {
+    let marker = path.join(RUN_DIR_MARKER);
+    if fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && fs::read_to_string(&marker).ok().as_deref() == Some("butler-run\n")
+    }) {
         return true;
     }
     is_legacy_run_artifact_dir(path)
@@ -498,9 +590,11 @@ fn is_legacy_run_artifact_dir(path: &Path) -> bool {
     {
         return false;
     }
-    LEGACY_RUN_ARTIFACT_FILES
-        .iter()
-        .any(|file_name| path.join(file_name).is_file())
+    LEGACY_RUN_ARTIFACT_FILES.iter().any(|file_name| {
+        fs::symlink_metadata(path.join(file_name)).is_ok_and(|metadata| {
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -542,6 +636,30 @@ mod tests {
         assert_eq!(
             fs::metadata(&artifact).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_artifact_write_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_artifact_dir("atomic_symlink");
+        let target = dir.join("outside-target");
+        fs::write(&target, b"leave me alone").unwrap();
+        let artifact = dir.join("provider_snapshot.png");
+        symlink(&target, &artifact).unwrap();
+
+        write_owner_only_atomic(&artifact, b"new artifact").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"leave me alone");
+        assert_eq!(fs::read(&artifact).unwrap(), b"new artifact");
+        assert!(
+            !fs::symlink_metadata(&artifact)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -838,6 +956,19 @@ mod tests {
         assert!(dir.join("manual").exists());
         assert!(dir.join("events.jsonl").exists());
         assert!(dir.join("events.unredacted.backup.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pruning_requires_valid_regular_run_marker() {
+        let dir = temp_artifact_dir("prune_marker_validation");
+        let invalid = dir.join("invalid");
+        fs::create_dir(&invalid).unwrap();
+        fs::write(invalid.join(RUN_DIR_MARKER), "not-butler\n").unwrap();
+
+        prune_run_artifact_dirs(&dir, 0).unwrap();
+
+        assert!(invalid.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

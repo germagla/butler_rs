@@ -62,7 +62,7 @@ flowchart LR
     History --> Artifacts
 ```
 
-The active start lock is process-local and global, which is appropriate for the single configured server this version targets. Future multi-server support should key active runs by workspace, guild, or server ID.
+The active start lock is cross-process and global, which is appropriate for the single configured server this version targets. Future multi-server support should key active runs by workspace, guild, or server ID.
 
 `src/server_service/` is split into start orchestration, status/diagnose, run queries, run tracking/artifact retention, response formatting, and shared types.
 
@@ -83,6 +83,35 @@ For a live Minecraft status probe without Discord:
 ```bash
 cargo run --bin status_debug -- your-server.example.com:25565
 ```
+
+For direct provider smoke tests without Discord:
+
+```bash
+# Authenticates, reads provider state, and checks Minecraft status without host mutations.
+cargo run --release -- --provider-check
+
+# Runs the configured provider start flow. This may wake an allocation and start the server.
+cargo run --release -- --provider-start-once
+```
+
+These commands may run while the LaunchAgent bot is active. They share Butler's cross-process
+start-admission lock, so a provider smoke test and a Discord start cannot overlap. A six-character
+run ID is printed, and diagnostic artifacts follow `ARTIFACT_CAPTURE` under `ARTIFACT_DIR`.
+Pterodactyl smoke tests borrow an already-ready FlareSolverr without stopping it; when no runtime
+is available, the CLI temporarily starts and supervises it, then stops it on normal exit or a
+handled interrupt. On Ctrl-C or SIGTERM, Butler retains admission ownership until the current
+provider result and any required submission verification finish, performs cleanup, and exits
+nonzero. An uncatchable forced kill can still leave local runtime cleanup for the next launch.
+
+`--provider-check` is read-only with respect to the server host. It does not require
+`DISCORD_TOKEN`, issue allocation wake requests, or issue power requests.
+`--provider-start-once` runs the default Minecraft preflight, the provider adapter, and the
+60-second provider-and-Minecraft fallback for an ambiguous submitted start. It does not exercise
+Discord response handling, run-history events, or `wait_online:true`. Successful/skipped commands
+return process exit status zero; failed or unverified commands return nonzero. A power POST can
+take up to 60 seconds, provider-level ambiguity verification can take another 60 seconds, and the
+outer provider/Minecraft fallback can take a final 60 seconds, so an ambiguous power operation may
+need about three minutes after allocation completes.
 
 ### Start Automatically On macOS
 
@@ -168,7 +197,7 @@ The expected media-stack configuration keeps FlareSolverr behind its own Compose
 
 For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It waits up to `PTERODACTYL_ALLOCATION_WAIT_SECS` for an active allocation, reports queue phase/position/estimate changes in an ordinary bot message that remains editable during long waits, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag.
 
-Wake/allocation and power-start uncertainty are tracked separately. A delayed allocation never triggers Minecraft submission verification because the power request has not happened yet. Each mutating request is issued at most once per command; ambiguous wake responses are checked through the read-only sleep-status endpoint, ambiguous power responses are checked through Pterodactyl resources, and only ambiguous power or browser-start submissions use Minecraft status as the service-level fallback. If the allocation deadline expires, running `/server start` again is safe: Butler inspects the current sleep status first and skips wake when the allocation is already `queued`, `waking`, or `active`.
+Wake/allocation and power-start uncertainty are tracked separately. A delayed allocation never triggers submission verification because the power request has not happened yet. Each mutating request is issued at most once per command. The power endpoint has a dedicated 60-second response timeout. Ambiguous wake responses are checked through the read-only sleep-status endpoint; ambiguous power responses are checked through Pterodactyl resources and a filtered API activity feed, using the pre-request activity ID as a correlation baseline. If the baseline request fails, Butler falls back to a bounded timestamp comparison. Each provider verification probe is bounded so Minecraft verification still gets time before the deadline. The service-level fallback checks provider state as well as Minecraft for ambiguous power starts, while ambiguous browser starts continue to use Minecraft status. If the allocation deadline expires, running `/server start` again is safe: Butler inspects the current sleep status first and skips wake when the allocation is already `queued`, `waking`, or `active`.
 
 Cloudflare clearance is kept in memory and requested from FlareSolverr with a 180-second challenge budget. A transient FlareSolverr availability failure is retried once before any provider mutation.
 
@@ -191,7 +220,9 @@ When artifact capture or run-event persistence is enabled, Butler verifies on st
 
 Butler creates artifact directories with owner-only permissions (`0700`) and artifact/event files with owner-only permissions (`0600`) on Unix. Startup also repairs permissions on recognized existing Butler run directories and `events*.jsonl` files without touching unknown directories or symlinks.
 
-Pterodactyl runs write a sanitized `provider_state.json` containing the current workflow stage, provider power state, suspension/limbo flags, the latest allocation phase/queue/connection fields, mutation flags, and the last transient error when applicable. They do not produce authenticated dashboard screenshots because FlareSolverr is used only to obtain Cloudflare clearance; the API token and Cloudflare cookies are never written to this artifact or injected into a browser session.
+When `ARTIFACT_CAPTURE` is not `off`, Pterodactyl starts write a sanitized `provider_state.json` containing the current workflow stage, provider power state, suspension/limbo flags, the latest allocation phase/queue/connection fields, power submission state (`dispatching`, `ambiguous`, `confirmed`, or `rejected`), confirmation source (`response`, `resources`, or `activity`) when confirmed, and the original sanitized error when an ambiguous response is later confirmed. They also render `provider_snapshot.png`, a fixed diagnostic image derived from a stricter public display model. Every terminal provider failure gets a snapshot even when detailed state could not be fetched. The image is attached to Discord when `BUTLER_ATTACH_SCREENSHOTS=true`; `ARTIFACT_CAPTURE=failure` limits it to failed or still-ambiguous states. Read-only Pterodactyl checks do not write either artifact.
+
+The Pterodactyl snapshot is not an authenticated dashboard screenshot. FlareSolverr is used only to obtain Cloudflare clearance, and the API token is never injected into a browser session. The image shows only provider state, allocation phase, submission state, mode flags, and an allowlisted error class. If service-level verification resolves an ambiguous submission, Butler replaces the attempted-state image with a confirmed-state image before the final Discord update. Connections, raw errors, authorization, cookies, response bodies, API tokens, server UUIDs, and local paths are excluded from the image. JSON and PNG artifacts are replaced atomically to avoid partial or stale attachments.
 
 ## Docker
 
