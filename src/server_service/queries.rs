@@ -40,7 +40,7 @@ pub async fn runs(ctx: Context<'_>, limit: Option<u8>) -> Result<()> {
             format!(
                 "`{}` {} by {} in {} ({}ms){}",
                 run.context.run_id,
-                run.outcome,
+                run.display_outcome(),
                 run.context.user_name,
                 run.context.guild_name,
                 run.duration_ms,
@@ -55,7 +55,7 @@ pub async fn runs(ctx: Context<'_>, limit: Option<u8>) -> Result<()> {
 
     send_text(
         ctx,
-        format!("Last {} completed runs:\n{}", runs.len(), lines),
+        format!("Last {} recent runs:\n{}", runs.len(), lines),
         true,
     )
     .await?;
@@ -82,13 +82,7 @@ pub async fn run(ctx: Context<'_>, run_id: String) -> Result<()> {
     if let Some(run) = ctx.data().run_store.find_scoped(&run_id, &scope).await {
         let outcome = run.outcome.clone();
         let detail = format_run_detail(&run);
-        send_with_optional_screenshot(
-            ctx,
-            detail,
-            run.screenshot_path.as_ref().map(PathBuf::from),
-            true,
-        )
-        .await?;
+        send_with_optional_screenshot(ctx, detail, run_screenshot_path(&run), true).await?;
         terminal::emit(terminal::line_for_context(
             "OK",
             &context,
@@ -153,13 +147,7 @@ pub async fn last_error(ctx: Context<'_>) -> Result<()> {
         let last_error_run = run.context.run_id.clone();
         let outcome = run.outcome.clone();
         let detail = format_run_detail(&run);
-        send_with_optional_screenshot(
-            ctx,
-            detail,
-            run.screenshot_path.as_ref().map(PathBuf::from),
-            true,
-        )
-        .await?;
+        send_with_optional_screenshot(ctx, detail, run_screenshot_path(&run), true).await?;
         terminal::emit(terminal::line_for_context(
             "OK",
             &context,
@@ -190,5 +178,51 @@ fn run_query_scope(access: &SensitiveCommandAccess) -> RunQueryScope {
         SensitiveCommandAccess::GuildAdministrator { guild_id } => {
             RunQueryScope::Guild(guild_id.clone())
         }
+    }
+}
+
+fn run_screenshot_path(run: &crate::run_history::RunSummary) -> Option<PathBuf> {
+    (run.context.provider != "pterodactyl")
+        .then(|| run.screenshot_path.as_ref().map(PathBuf::from))
+        .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run_history::{RunContext, RunSummary};
+
+    fn run_summary(provider: &str) -> RunSummary {
+        RunSummary {
+            context: RunContext {
+                run_id: "abc123".to_string(),
+                command: "server.start".to_string(),
+                provider: provider.to_string(),
+                guild_id: Some("guild".to_string()),
+                guild_name: "Guild".to_string(),
+                channel_id: "channel".to_string(),
+                channel_name: Some("Channel".to_string()),
+                user_id: "user".to_string(),
+                user_name: "User".to_string(),
+            },
+            started_at_ms: 1,
+            finished_at_ms: 2,
+            duration_ms: 1,
+            outcome: "StartRequested".to_string(),
+            final_provider_status: Some("Starting".to_string()),
+            final_minecraft_status: None,
+            screenshot_path: Some("legacy.png".to_string()),
+            error_class: None,
+            steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn historical_pterodactyl_runs_never_attach_screenshots() {
+        assert_eq!(run_screenshot_path(&run_summary("pterodactyl")), None);
+        assert_eq!(
+            run_screenshot_path(&run_summary("aternos")),
+            Some(PathBuf::from("legacy.png"))
+        );
     }
 }

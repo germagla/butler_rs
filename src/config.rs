@@ -71,6 +71,7 @@ pub struct PterodactylConfig {
     pub api_token: String,
     pub power_enabled: bool,
     pub allocation_wait_secs: u64,
+    pub allocation_max_wait_secs: u64,
     pub flaresolverr_url: Url,
     pub flaresolverr_container: String,
     pub orbctl_path: PathBuf,
@@ -123,16 +124,18 @@ impl Config {
                 chrome_path: optional_nonempty_var("CHROME").map(PathBuf::from),
             }),
             ServerProviderKind::Pterodactyl => {
+                let allocation_wait_secs =
+                    bounded_positive_u64_var("PTERODACTYL_ALLOCATION_WAIT_SECS", 1_200, 3_600)?;
+                let allocation_max_wait_secs =
+                    bounded_positive_u64_var("PTERODACTYL_ALLOCATION_MAX_WAIT_SECS", 3_600, 3_600)?;
+                validate_allocation_waits(allocation_wait_secs, allocation_max_wait_secs)?;
                 ProviderConfig::Pterodactyl(Box::new(PterodactylConfig {
                     panel_origin: panel_origin_var("PTERODACTYL_PANEL_URL")?,
                     server_id: pterodactyl_server_id_var("PTERODACTYL_SERVER_ID")?,
                     api_token: required_nonempty_var("PTERODACTYL_API_TOKEN")?,
                     power_enabled: bool_var("PTERODACTYL_POWER_ENABLED", false)?,
-                    allocation_wait_secs: bounded_positive_u64_var(
-                        "PTERODACTYL_ALLOCATION_WAIT_SECS",
-                        1_200,
-                        3_600,
-                    )?,
+                    allocation_wait_secs,
+                    allocation_max_wait_secs,
                     flaresolverr_url: flaresolverr_url_var("FLARESOLVERR_URL")?,
                     flaresolverr_container: container_name_var("FLARESOLVERR_CONTAINER")?,
                     orbctl_path: PathBuf::from(
@@ -328,6 +331,15 @@ fn parse_pterodactyl_server_id(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+fn validate_allocation_waits(wait_secs: u64, max_wait_secs: u64) -> Result<()> {
+    if max_wait_secs < wait_secs {
+        bail!(
+            "PTERODACTYL_ALLOCATION_MAX_WAIT_SECS must be greater than or equal to PTERODACTYL_ALLOCATION_WAIT_SECS"
+        );
+    }
+    Ok(())
+}
+
 fn bool_var(name: &str, default: bool) -> Result<bool> {
     parse_bool_value(env::var(name).ok().as_deref(), default)
         .with_context(|| format!("{name} must be a boolean"))
@@ -494,6 +506,22 @@ mod tests {
         assert!(bounded_positive_u64_var_value(Some("0"), 1_200, 3_600).is_err());
         assert!(bounded_positive_u64_var_value(Some("3601"), 1_200, 3_600).is_err());
         assert!(bounded_positive_u64_var_value(Some("never"), 1_200, 3_600).is_err());
+        assert_eq!(
+            bounded_positive_u64_var_value(None, 3_600, 3_600).unwrap(),
+            3_600
+        );
+        assert_eq!(
+            bounded_positive_u64_var_value(Some("2400"), 3_600, 3_600).unwrap(),
+            2_400
+        );
+        assert!(bounded_positive_u64_var_value(Some("3601"), 3_600, 3_600).is_err());
+    }
+
+    #[test]
+    fn validates_allocation_wait_deadlines() {
+        assert!(validate_allocation_waits(1_200, 3_600).is_ok());
+        assert!(validate_allocation_waits(1_200, 1_200).is_ok());
+        assert!(validate_allocation_waits(1_201, 1_200).is_err());
     }
 
     #[test]

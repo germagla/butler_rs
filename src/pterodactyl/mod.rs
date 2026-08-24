@@ -1,6 +1,4 @@
 mod lifecycle;
-mod snapshot;
-
 pub use lifecycle::{FlareSolverrRuntimeConfig, FlareSolverrSupervisor};
 
 use crate::{
@@ -37,19 +35,25 @@ const API_TIMEOUT: Duration = Duration::from_secs(15);
 const POWER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const FLARESOLVERR_REQUEST_TIMEOUT_MS: u64 = 180_000;
 const FLARESOLVERR_TIMEOUT: Duration = Duration::from_secs(195);
+const FLARESOLVERR_RUNTIME_ATTEMPTS: usize = 2;
+const FLARESOLVERR_RUNTIME_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const FLARESOLVERR_CLEARANCE_ATTEMPTS: usize = 2;
 const FLARESOLVERR_CLEARANCE_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const FLARESOLVERR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const STOPPING_WAIT_ATTEMPTS: usize = 6;
 const STOPPING_WAIT_INTERVAL: Duration = Duration::from_secs(5);
 const ALLOCATION_WAIT_INTERVAL: Duration = Duration::from_secs(10);
 const ALLOCATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const ALLOCATION_EXTENSION_ERROR_LIMIT: usize = 3;
+const ALLOCATION_EXTENSION_STALE_TIMEOUT: Duration = Duration::from_secs(120);
+const POST_ALLOCATION_RESOURCE_ATTEMPTS: usize = 3;
+const POST_ALLOCATION_RESOURCE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SUBMISSION_VERIFY_ATTEMPTS: usize = 12;
 const SUBMISSION_VERIFY_INTERVAL: Duration = Duration::from_secs(5);
 const SUBMISSION_VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 const SUBMISSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const STATE_ARTIFACT: &str = "provider_state.json";
-const SNAPSHOT_ARTIFACT: &str = "provider_snapshot.png";
 
 pub struct PterodactylProvider {
     config: PterodactylConfig,
@@ -58,8 +62,12 @@ pub struct PterodactylProvider {
     api_client: Client,
     flaresolverr_client: Client,
     clearance: Mutex<Option<Clearance>>,
+    clearance_refresh: Mutex<()>,
+    flaresolverr_runtime: FlareSolverrRuntimeConfig,
     allocation_wait_timeout: Duration,
+    allocation_max_wait_timeout: Duration,
     allocation_wait_interval: Duration,
+    post_allocation_resource_retry_interval: Duration,
     submission_probe_timeout: Duration,
 }
 
@@ -82,6 +90,8 @@ impl PterodactylProvider {
             .build()
             .context("could not build FlareSolverr client")?;
         let allocation_wait_timeout = Duration::from_secs(config.allocation_wait_secs);
+        let allocation_max_wait_timeout = Duration::from_secs(config.allocation_max_wait_secs);
+        let flaresolverr_runtime = FlareSolverrRuntimeConfig::new(&config, &artifact_dir);
         Ok(Self {
             config,
             artifact_dir,
@@ -89,8 +99,12 @@ impl PterodactylProvider {
             api_client,
             flaresolverr_client,
             clearance: Mutex::new(None),
+            clearance_refresh: Mutex::new(()),
+            flaresolverr_runtime,
             allocation_wait_timeout,
+            allocation_max_wait_timeout,
             allocation_wait_interval: ALLOCATION_WAIT_INTERVAL,
+            post_allocation_resource_retry_interval: POST_ALLOCATION_RESOURCE_RETRY_INTERVAL,
             submission_probe_timeout: SUBMISSION_PROBE_TIMEOUT,
         })
     }
@@ -103,7 +117,7 @@ impl PterodactylProvider {
         emit_progress(
             progress,
             ProviderProgressStage::SolvingChallenge,
-            "Preparing provider access",
+            "Connecting to Play Hosting",
         );
         let details = self.details_with_refresh().await?;
         let mut is_limbo = details.is_limbo;
@@ -141,10 +155,32 @@ impl PterodactylProvider {
             ServerDetailsAction::FetchResources => {}
         }
 
-        let mut resources = match self.resources_with_refresh().await {
+        let initial_resources = if let Some(allocation) = allocation.as_ref() {
+            self.resources_after_allocation_with_retry(run_id, allocation, progress)
+                .await
+        } else {
+            self.resources_with_refresh().await
+        };
+        let mut resources = match initial_resources {
             Ok(resources) => resources,
-            Err(failure) if failure.error_class == "ProviderStateConflict" => {
-                let refreshed = self.details_with_refresh().await?;
+            Err(mut failure) if failure.error_class == "ProviderStateConflict" => {
+                if allocation.is_some() {
+                    backfill_failure_artifacts(&mut failure, artifact_path);
+                    return Err(attach_minecraft_address(failure, &minecraft_address));
+                }
+                let refreshed = self
+                    .details_with_refresh()
+                    .await
+                    .map_err(|mut inspection| {
+                        backfill_failure_artifacts(
+                            &mut inspection,
+                            failure
+                                .detail_artifact_path
+                                .clone()
+                                .or(artifact_path.clone()),
+                        );
+                        attach_minecraft_address(inspection, &minecraft_address)
+                    })?;
                 if refreshed.is_limbo {
                     is_limbo = true;
                     let allocation_result = self
@@ -156,7 +192,13 @@ impl PterodactylProvider {
                         })?;
                     minecraft_address = allocation_result.minecraft_address.clone();
                     allocation = Some(allocation_result);
-                    self.resources_with_refresh().await.map_err(|mut failure| {
+                    self.resources_after_allocation_with_retry(
+                        run_id,
+                        allocation.as_ref().expect("allocation was just stored"),
+                        progress,
+                    )
+                    .await
+                    .map_err(|mut failure| {
                         backfill_failure_artifacts(&mut failure, artifact_path.clone());
                         attach_minecraft_address(failure, &minecraft_address)
                     })?
@@ -228,16 +270,13 @@ impl PterodactylProvider {
         }
 
         match action {
-            StateAction::AlreadyActive => {
-                let screenshot_path = snapshot_path_for_detail(artifact_path.as_ref());
-                Ok(ProviderStartResult {
-                    outcome: StartOutcome::AlreadyActive,
-                    provider_status: normalized_state(&resources.current_state),
-                    minecraft_address,
-                    screenshot_path,
-                    detail_artifact_path: artifact_path,
-                })
-            }
+            StateAction::AlreadyActive => Ok(ProviderStartResult {
+                outcome: StartOutcome::AlreadyActive,
+                provider_status: normalized_state(&resources.current_state),
+                minecraft_address,
+                screenshot_path: None,
+                detail_artifact_path: artifact_path,
+            }),
             StateAction::RequestStart => {
                 if !self.config.power_enabled {
                     return Err(attach_minecraft_address(
@@ -253,7 +292,7 @@ impl PterodactylProvider {
                 emit_progress(
                     progress,
                     ProviderProgressStage::RequestingPower,
-                    "Host allocation is ready; requesting server power",
+                    "A host is ready. Sending the Minecraft start command to Play Hosting.",
                 );
                 let activity_baseline =
                     timeout(self.submission_probe_timeout, self.activity_with_refresh())
@@ -300,7 +339,7 @@ impl PterodactylProvider {
                         emit_progress(
                             progress,
                             ProviderProgressStage::VerifyingPower,
-                            "Power response was ambiguous; checking provider state and activity",
+                            "The start command may have gone through. Checking Play Hosting before sending anything again.",
                         );
                         match self
                             .verify_ambiguous_power(
@@ -401,12 +440,13 @@ impl PterodactylProvider {
                     )
                     .await
                     .or(artifact_path);
-                let screenshot_path = snapshot_path_for_detail(artifact_path.as_ref());
                 Ok(ProviderStartResult {
                     outcome: StartOutcome::StartRequested,
-                    provider_status: "Start requested".to_string(),
+                    provider_status: confirmation
+                        .provider_state
+                        .unwrap_or_else(|| "Start requested".to_string()),
                     minecraft_address,
-                    screenshot_path,
+                    screenshot_path: None,
                     detail_artifact_path: artifact_path,
                 })
             }
@@ -439,11 +479,9 @@ impl PterodactylProvider {
         match self.start_inner(run_id, progress).await {
             Ok(result) => Ok(result),
             Err(mut failure) => {
-                if failure.uncertain_mutation.may_have_started_server()
-                    || failure.screenshot_path.is_none()
-                {
-                    failure.screenshot_path = self
-                        .write_terminal_failure_snapshot(
+                if failure.detail_artifact_path.is_none() {
+                    failure.detail_artifact_path = self
+                        .write_terminal_failure_artifact(
                             run_id,
                             &failure.error_class,
                             failure.uncertain_mutation,
@@ -466,24 +504,24 @@ impl PterodactylProvider {
             if sleep_status_allocation_ready(&allocation) {
                 match self.resources_with_refresh().await {
                     Ok(resources) => {
-                        return Ok(provider_check_result(
-                            if resources.is_suspended {
-                                "Suspended".to_string()
-                            } else {
-                                normalized_state(&resources.current_state)
-                            },
-                            minecraft_address,
-                        ));
+                        let status = if !resources.is_suspended
+                            && normalized_state(&resources.current_state) == "Offline"
+                        {
+                            "A host is allocated, but the Minecraft server process is offline."
+                                .to_string()
+                        } else if resources.is_suspended {
+                            "Suspended".to_string()
+                        } else {
+                            normalized_state(&resources.current_state)
+                        };
+                        return Ok(provider_check_result(status, minecraft_address));
                     }
                     Err(failure) if failure.error_class == "ProviderStateConflict" => {}
                     Err(failure) => return Err(failure),
                 }
             }
             return Ok(provider_check_result(
-                format!(
-                    "Allocation {}",
-                    allocation.phase.trim().to_ascii_lowercase()
-                ),
+                allocation_status_detail(&allocation),
                 minecraft_address,
             ));
         }
@@ -505,8 +543,7 @@ impl PterodactylProvider {
         match self.fetch_resources(cached.as_ref()).await {
             Ok(resources) => Ok(resources),
             Err(error) if error.challenge => {
-                let refreshed = self.refresh_clearance().await?;
-                *self.clearance.lock().await = Some(refreshed.clone());
+                let refreshed = self.refresh_clearance(cached.as_ref()).await?;
                 self.fetch_resources(Some(&refreshed))
                     .await
                     .map_err(ApiError::into_provider_failure)
@@ -515,14 +552,82 @@ impl PterodactylProvider {
         }
     }
 
+    async fn resources_after_allocation_with_retry(
+        &self,
+        run_id: &str,
+        allocation: &AllocationResult,
+        progress: Option<&ProviderProgressSender>,
+    ) -> Result<PterodactylResources, ProviderStartFailure> {
+        let started_at = Instant::now();
+        for attempt in 1..=POST_ALLOCATION_RESOURCE_ATTEMPTS {
+            match self.resources_with_refresh().await {
+                Ok(resources) => return Ok(resources),
+                Err(failure) => {
+                    let category = post_allocation_resource_retry_category(&failure);
+                    let should_retry =
+                        category.is_some() && attempt < POST_ALLOCATION_RESOURCE_ATTEMPTS;
+                    if should_retry {
+                        emit_progress(
+                            progress,
+                            ProviderProgressStage::WaitingForAllocation,
+                            format!(
+                                "A host is ready, but the server controls are temporarily unavailable. Retrying the read-only check ({}/{}) without sending wake or power again.",
+                                attempt + 1,
+                                POST_ALLOCATION_RESOURCE_ATTEMPTS
+                            ),
+                        );
+                        sleep(self.post_allocation_resource_retry_interval * attempt as u32).await;
+                        continue;
+                    }
+
+                    let diagnostics = FailureArtifactDiagnostics {
+                        failed_stage: "post_allocation_resources",
+                        transport_category: category,
+                        attempt_count: attempt,
+                        timeout_ms: API_TIMEOUT.as_millis() as u64,
+                        elapsed_ms: started_at.elapsed().as_millis(),
+                    };
+                    let artifact_path = self
+                        .write_post_allocation_failure_artifact(
+                            run_id,
+                            allocation,
+                            &failure.error_class,
+                            &diagnostics,
+                        )
+                        .await;
+
+                    if let Some(category) = category {
+                        let error_class = if category == "timeout" {
+                            "ProviderControlsTimeout"
+                        } else {
+                            "ProviderControlsUnavailable"
+                        };
+                        let mut exhausted = provider_failure(
+                            error_class,
+                            "Play Hosting allocated a host, but Butler could not read the server controls after three attempts; no power command was sent",
+                            artifact_path,
+                            ProviderMutation::None,
+                        );
+                        exhausted.retryable = true;
+                        return Err(exhausted);
+                    }
+
+                    let mut failure = failure;
+                    backfill_failure_artifacts(&mut failure, artifact_path);
+                    return Err(failure);
+                }
+            }
+        }
+        unreachable!("post-allocation resource attempts are nonzero")
+    }
+
     async fn details_with_refresh(&self) -> Result<PterodactylServer, ProviderStartFailure> {
         let cached = self.cached_clearance().await;
 
         match self.fetch_details(cached.as_ref()).await {
             Ok(details) => Ok(details),
             Err(error) if error.challenge => {
-                let refreshed = self.refresh_clearance().await?;
-                *self.clearance.lock().await = Some(refreshed.clone());
+                let refreshed = self.refresh_clearance(cached.as_ref()).await?;
                 self.fetch_details(Some(&refreshed))
                     .await
                     .map_err(ApiError::into_provider_failure)
@@ -537,8 +642,7 @@ impl PterodactylProvider {
         match self.fetch_activity(cached.as_ref()).await {
             Ok(activity) => Ok(activity),
             Err(error) if error.challenge => {
-                let refreshed = self.refresh_clearance().await?;
-                *self.clearance.lock().await = Some(refreshed.clone());
+                let refreshed = self.refresh_clearance(cached.as_ref()).await?;
                 self.fetch_activity(Some(&refreshed))
                     .await
                     .map_err(ApiError::into_provider_failure)
@@ -561,12 +665,7 @@ impl PterodactylProvider {
     ) -> Result<PterodactylServer, ApiError> {
         let url = self.api_url(&self.config.server_id, None)?;
         let request = self.api_request(self.api_client.get(url), clearance)?;
-        let response = request.send().await.map_err(|_| {
-            ApiError::transient(
-                "ProviderUnavailable",
-                "Provider request could not be completed",
-            )
-        })?;
+        let response = request.send().await.map_err(classify_read_request_error)?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response_body(response).await?;
@@ -600,12 +699,7 @@ impl PterodactylProvider {
     ) -> Result<PterodactylResources, ApiError> {
         let url = self.api_url(&self.config.server_id, Some("resources"))?;
         let request = self.api_request(self.api_client.get(url), clearance)?;
-        let response = request.send().await.map_err(|_| {
-            ApiError::transient(
-                "ProviderUnavailable",
-                "Provider request could not be completed",
-            )
-        })?;
+        let response = request.send().await.map_err(classify_read_request_error)?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response_body(response).await?;
@@ -781,7 +875,7 @@ impl PterodactylProvider {
         emit_progress(
             progress,
             ProviderProgressStage::RequestingAllocation,
-            "Requesting Play Hosting allocation",
+            "Play Hosting is asleep. Requesting a host for the server.",
         );
         self.send_wake(server_uuid).await?;
         self.wait_for_allocation_ready(run_id, server_uuid, status, true, progress)
@@ -801,7 +895,8 @@ impl PterodactylProvider {
         wake_requested: bool,
         progress: Option<&ProviderProgressSender>,
     ) -> Result<PlaySleepStatus, ProviderStartFailure> {
-        let deadline = Instant::now()
+        let allocation_started_at = Instant::now();
+        let initial_deadline = allocation_started_at
             .checked_add(self.allocation_wait_timeout)
             .ok_or_else(|| {
                 provider_failure(
@@ -811,10 +906,25 @@ impl PterodactylProvider {
                     ProviderMutation::None,
                 )
             })?;
+        let hard_deadline = allocation_started_at
+            .checked_add(self.allocation_max_wait_timeout)
+            .ok_or_else(|| {
+                provider_failure(
+                    "ProviderConfiguration",
+                    "The maximum allocation timeout exceeded the supported duration",
+                    None,
+                    ProviderMutation::None,
+                )
+            })?;
+        let mut deadline = initial_deadline;
+        let mut extension_active = false;
         let mut last_error = None;
         let mut last_progress_at = None;
         let mut last_progress_key = None;
-        let allocation_started_at = Instant::now();
+        let mut poll_attempt_count = 1usize;
+        let mut consecutive_poll_errors = 0usize;
+        let mut last_healthy_observation_at = allocation_started_at;
+        let mut last_transport_category = None;
 
         loop {
             let artifact_path = self
@@ -830,7 +940,7 @@ impl PterodactylProvider {
                     error_class,
                     message,
                     artifact_path,
-                    ProviderMutation::WakeAllocation,
+                    ProviderMutation::None,
                 ));
             }
             emit_allocation_progress(
@@ -843,9 +953,32 @@ impl PterodactylProvider {
             if sleep_status_allocation_ready(&last_status) {
                 return Ok(last_status);
             }
+            if extension_active
+                && (consecutive_poll_errors >= ALLOCATION_EXTENSION_ERROR_LIMIT
+                    || last_healthy_observation_at.elapsed() >= ALLOCATION_EXTENSION_STALE_TIMEOUT)
+            {
+                break;
+            }
 
             let now = Instant::now();
             if now >= deadline {
+                if !extension_active
+                    && now < hard_deadline
+                    && last_error.is_none()
+                    && allocation_status_supports_extension(&last_status)
+                {
+                    extension_active = true;
+                    deadline = hard_deadline;
+                    emit_progress(
+                        progress,
+                        ProviderProgressStage::WaitingForAllocation,
+                        format!(
+                            "Play Hosting is still making healthy allocation progress. Extending the wait up to {} total without sending wake or power again.",
+                            terminal::format_duration(self.allocation_max_wait_timeout.as_millis())
+                        ),
+                    );
+                    continue;
+                }
                 break;
             }
             sleep(std::cmp::min(
@@ -856,35 +989,58 @@ impl PterodactylProvider {
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break;
+                continue;
             }
+            poll_attempt_count += 1;
             match timeout(remaining, self.sleep_status_with_refresh(server_uuid)).await {
                 Ok(Ok(status)) => {
+                    if allocation_status_supports_extension(&status) {
+                        last_healthy_observation_at = Instant::now();
+                    }
                     last_status = status;
                     last_error = None;
+                    last_transport_category = None;
+                    consecutive_poll_errors = 0;
                 }
                 Ok(Err(failure)) if failure.retryable => {
+                    last_transport_category =
+                        post_allocation_resource_retry_category(&failure).or(Some("transport"));
                     last_error = Some(failure.message);
+                    consecutive_poll_errors += 1;
                 }
                 Ok(Err(failure)) => return Err(failure),
-                Err(_) => break,
+                Err(_) => {
+                    last_transport_category = Some("timeout");
+                    last_error = Some("Provider allocation status poll timed out".to_string());
+                    consecutive_poll_errors += 1;
+                }
             }
         }
 
         let detail = allocation_timeout_detail(&last_status, last_error.as_deref());
+        let diagnostics = FailureArtifactDiagnostics {
+            failed_stage: "allocation",
+            transport_category: last_transport_category,
+            attempt_count: poll_attempt_count,
+            timeout_ms: deadline
+                .saturating_duration_since(allocation_started_at)
+                .as_millis() as u64,
+            elapsed_ms: allocation_started_at.elapsed().as_millis(),
+        };
         let artifact_path = self
-            .write_allocation_state_artifact(
+            .write_allocation_failure_artifact(
                 run_id,
                 &last_status,
                 wake_requested,
                 last_error.as_deref(),
+                &diagnostics,
             )
             .await;
         Err(provider_failure(
             "ProviderAllocationTimeout",
             detail,
             artifact_path,
-            ProviderMutation::WakeAllocation,
+            ProviderMutation::None,
         ))
     }
 
@@ -1045,8 +1201,7 @@ impl PterodactylProvider {
         match self.fetch_sleep_status(server_uuid, cached.as_ref()).await {
             Ok(status) => Ok(status),
             Err(error) if error.challenge => {
-                let refreshed = self.refresh_clearance().await?;
-                *self.clearance.lock().await = Some(refreshed.clone());
+                let refreshed = self.refresh_clearance(cached.as_ref()).await?;
                 self.fetch_sleep_status(server_uuid, Some(&refreshed))
                     .await
                     .map_err(ApiError::into_provider_failure)
@@ -1062,12 +1217,7 @@ impl PterodactylProvider {
     ) -> Result<PlaySleepStatus, ApiError> {
         let url = self.api_url(server_uuid, Some("sleep-status"))?;
         let request = self.api_request(self.api_client.get(url), clearance)?;
-        let response = request.send().await.map_err(|_| {
-            ApiError::transient(
-                "ProviderUnavailable",
-                "Provider request could not be completed",
-            )
-        })?;
+        let response = request.send().await.map_err(classify_read_request_error)?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response_body(response).await?;
@@ -1125,23 +1275,61 @@ impl PterodactylProvider {
         })
     }
 
-    async fn refresh_clearance(&self) -> Result<Clearance, ProviderStartFailure> {
-        let mut last_failure = None;
-        for attempt in 1..=FLARESOLVERR_CLEARANCE_ATTEMPTS {
-            match self.refresh_clearance_once().await {
-                Ok(clearance) => return Ok(clearance),
-                Err(failure)
-                    if clearance_failure_is_retryable(&failure)
-                        && attempt < FLARESOLVERR_CLEARANCE_ATTEMPTS =>
-                {
-                    last_failure = Some(failure);
-                    sleep(FLARESOLVERR_CLEARANCE_RETRY_INTERVAL).await;
-                }
-                Err(failure) => return Err(failure),
-            }
+    async fn refresh_clearance(
+        &self,
+        rejected: Option<&Clearance>,
+    ) -> Result<Clearance, ProviderStartFailure> {
+        let _refresh_guard = self.clearance_refresh.lock().await;
+        if let Some(current) = self.cached_clearance().await
+            && rejected != Some(&current)
+        {
+            return Ok(current);
         }
 
-        Err(last_failure.expect("clearance attempts must record a failure"))
+        let runtime = self.acquire_flaresolverr_runtime().await?;
+
+        let result = async {
+            let mut last_failure = None;
+            for attempt in 1..=FLARESOLVERR_CLEARANCE_ATTEMPTS {
+                match self.refresh_clearance_once().await {
+                    Ok(clearance) => return Ok(clearance),
+                    Err(failure)
+                        if clearance_failure_is_retryable(&failure)
+                            && attempt < FLARESOLVERR_CLEARANCE_ATTEMPTS =>
+                    {
+                        last_failure = Some(failure);
+                        sleep(FLARESOLVERR_CLEARANCE_RETRY_INTERVAL).await;
+                    }
+                    Err(failure) => return Err(failure),
+                }
+            }
+            Err(last_failure.expect("clearance attempts must record a failure"))
+        }
+        .await;
+
+        if let Ok(clearance) = &result {
+            *self.clearance.lock().await = Some(clearance.clone());
+        }
+        sleep(FLARESOLVERR_SHUTDOWN_GRACE).await;
+        runtime.shutdown().await;
+        result
+    }
+
+    async fn acquire_flaresolverr_runtime(
+        &self,
+    ) -> Result<lifecycle::FlareSolverrOperationRuntime, ProviderStartFailure> {
+        for attempt in 1..=FLARESOLVERR_RUNTIME_ATTEMPTS {
+            match FlareSolverrSupervisor::ensure_for_operation(self.flaresolverr_runtime.clone())
+                .await
+            {
+                Ok(runtime) => return Ok(runtime),
+                Err(_) if attempt < FLARESOLVERR_RUNTIME_ATTEMPTS => {
+                    sleep(FLARESOLVERR_RUNTIME_RETRY_INTERVAL).await
+                }
+                Err(error) => return Err(flaresolverr_runtime_failure(&error)),
+            }
+        }
+        unreachable!("runtime attempts must return a result")
     }
 
     async fn refresh_clearance_once(&self) -> Result<Clearance, ProviderStartFailure> {
@@ -1180,6 +1368,12 @@ impl PterodactylProvider {
         let body = limited_response_body(response, MAX_RESPONSE_BYTES)
             .await
             .map_err(|error| match error {
+                LimitedBodyError::Timeout | LimitedBodyError::Connect => {
+                    retryable_provider_failure(
+                        "FlareSolverrUnavailable",
+                        "FlareSolverr response connection ended before completion",
+                    )
+                }
                 LimitedBodyError::Read => provider_failure(
                     "FlareSolverrProtocol",
                     "FlareSolverr response could not be read",
@@ -1231,6 +1425,12 @@ impl PterodactylProvider {
                 enabled: None,
                 wake_requested: false,
                 last_error: None,
+                failed_stage: None,
+                transport_category: None,
+                attempt_count: None,
+                timeout_ms: None,
+                elapsed_ms: None,
+                power_request_attempted: None,
                 power_submission_state: None,
                 power_confirmation_source: None,
             },
@@ -1244,37 +1444,40 @@ impl PterodactylProvider {
         source: SubmissionVerificationSource,
         observed_state: &str,
     ) -> Option<PathBuf> {
-        let detail_path = self
-            .write_state_artifact_value(
-                run_id,
-                &StateArtifact {
-                    provider: "pterodactyl",
-                    workflow_stage: "submission_verified",
-                    current_state: Some(observed_state),
-                    is_suspended: None,
-                    is_limbo: None,
-                    phase: None,
-                    connection: None,
-                    position: None,
-                    total: None,
-                    estimated_minutes: None,
-                    blocked: None,
-                    enabled: None,
-                    wake_requested: false,
-                    last_error: None,
-                    power_submission_state: Some(PowerSubmissionState::Confirmed),
-                    power_confirmation_source: Some(match source {
-                        SubmissionVerificationSource::Provider => {
-                            PowerConfirmationSource::ProviderVerification
-                        }
-                        SubmissionVerificationSource::Minecraft => {
-                            PowerConfirmationSource::Minecraft
-                        }
-                    }),
-                },
-            )
-            .await;
-        snapshot_path_for_detail(detail_path.as_ref())
+        self.write_state_artifact_value(
+            run_id,
+            &StateArtifact {
+                provider: "pterodactyl",
+                workflow_stage: "submission_verified",
+                current_state: Some(observed_state),
+                is_suspended: None,
+                is_limbo: None,
+                phase: None,
+                connection: None,
+                position: None,
+                total: None,
+                estimated_minutes: None,
+                blocked: None,
+                enabled: None,
+                wake_requested: false,
+                last_error: None,
+                failed_stage: None,
+                transport_category: None,
+                attempt_count: None,
+                timeout_ms: None,
+                elapsed_ms: None,
+                power_request_attempted: Some(true),
+                power_submission_state: Some(PowerSubmissionState::Confirmed),
+                power_confirmation_source: Some(match source {
+                    SubmissionVerificationSource::Provider => {
+                        PowerConfirmationSource::ProviderVerification
+                    }
+                    SubmissionVerificationSource::Minecraft => PowerConfirmationSource::Minecraft,
+                }),
+            },
+        )
+        .await;
+        None
     }
 
     async fn write_allocation_state_artifact(
@@ -1284,11 +1487,68 @@ impl PterodactylProvider {
         wake_requested: bool,
         last_error: Option<&str>,
     ) -> Option<PathBuf> {
+        self.write_allocation_artifact(
+            run_id,
+            "allocation",
+            status,
+            wake_requested,
+            last_error,
+            None,
+        )
+        .await
+    }
+
+    async fn write_allocation_failure_artifact(
+        &self,
+        run_id: &str,
+        status: &PlaySleepStatus,
+        wake_requested: bool,
+        last_error: Option<&str>,
+        diagnostics: &FailureArtifactDiagnostics<'_>,
+    ) -> Option<PathBuf> {
+        self.write_allocation_artifact(
+            run_id,
+            "allocation",
+            status,
+            wake_requested,
+            last_error,
+            Some(diagnostics),
+        )
+        .await
+    }
+
+    async fn write_post_allocation_failure_artifact(
+        &self,
+        run_id: &str,
+        allocation: &AllocationResult,
+        last_error: &str,
+        diagnostics: &FailureArtifactDiagnostics<'_>,
+    ) -> Option<PathBuf> {
+        self.write_allocation_artifact(
+            run_id,
+            "provider_controls",
+            &allocation.status,
+            allocation.wake_requested,
+            Some(last_error),
+            Some(diagnostics),
+        )
+        .await
+    }
+
+    async fn write_allocation_artifact(
+        &self,
+        run_id: &str,
+        workflow_stage: &str,
+        status: &PlaySleepStatus,
+        wake_requested: bool,
+        last_error: Option<&str>,
+        diagnostics: Option<&FailureArtifactDiagnostics<'_>>,
+    ) -> Option<PathBuf> {
         self.write_state_artifact_value(
             run_id,
             &StateArtifact {
                 provider: "pterodactyl",
-                workflow_stage: "allocation",
+                workflow_stage,
                 current_state: None,
                 is_suspended: None,
                 is_limbo: Some(true),
@@ -1301,6 +1561,12 @@ impl PterodactylProvider {
                 enabled: status.enabled,
                 wake_requested,
                 last_error,
+                failed_stage: diagnostics.map(|value| value.failed_stage),
+                transport_category: diagnostics.and_then(|value| value.transport_category),
+                attempt_count: diagnostics.map(|value| value.attempt_count),
+                timeout_ms: diagnostics.map(|value| value.timeout_ms),
+                elapsed_ms: diagnostics.map(|value| value.elapsed_ms),
+                power_request_attempted: Some(false),
                 power_submission_state: None,
                 power_confirmation_source: None,
             },
@@ -1333,6 +1599,17 @@ impl PterodactylProvider {
                     .allocation
                     .is_some_and(|allocation| allocation.wake_requested),
                 last_error: state.last_error,
+                failed_stage: None,
+                transport_category: None,
+                attempt_count: None,
+                timeout_ms: None,
+                elapsed_ms: None,
+                power_request_attempted: match state.submission_state {
+                    PowerSubmissionState::Dispatching => None,
+                    PowerSubmissionState::Ambiguous
+                    | PowerSubmissionState::Confirmed
+                    | PowerSubmissionState::Rejected => Some(true),
+                },
                 power_submission_state: Some(state.submission_state),
                 power_confirmation_source: state.confirmation_source,
             },
@@ -1347,11 +1624,6 @@ impl PterodactylProvider {
     ) -> Option<PathBuf> {
         let run_dir = self.artifact_dir.join(run_id);
         if self.artifact_capture == ArtifactCapture::Off {
-            if let Err(error) =
-                remove_snapshot_artifact_async(run_dir.join(SNAPSHOT_ARTIFACT)).await
-            {
-                emit_snapshot_warning(run_id, &error);
-            }
             return None;
         }
         let path = run_dir.join(STATE_ARTIFACT);
@@ -1372,99 +1644,83 @@ impl PterodactylProvider {
         .context("provider state artifact task failed")
         .and_then(|result| result);
         match result {
-            Ok(()) => {
-                let snapshot_path = run_dir.join(SNAPSHOT_ARTIFACT);
-                if should_capture_snapshot(self.artifact_capture, artifact) {
-                    let _ = self.write_snapshot_artifact(run_id, artifact).await;
-                } else if let Err(error) = remove_snapshot_artifact_async(snapshot_path).await {
-                    emit_snapshot_warning(run_id, &error);
-                }
-                Some(path)
-            }
+            Ok(()) => Some(path),
             Err(error) => {
-                if let Err(cleanup_error) =
-                    remove_snapshot_artifact_async(run_dir.join(SNAPSHOT_ARTIFACT)).await
-                {
-                    emit_snapshot_warning(run_id, &cleanup_error);
-                }
                 emit_state_artifact_warning(run_id, &error);
                 None
             }
         }
     }
 
-    async fn write_terminal_failure_snapshot(
+    async fn write_terminal_failure_artifact(
         &self,
         run_id: &str,
         error_class: &str,
         uncertain_mutation: ProviderMutation,
     ) -> Option<PathBuf> {
         let submission_attempted = uncertain_mutation.may_have_started_server();
-        let artifact = StateArtifact {
-            provider: "pterodactyl",
-            workflow_stage: if submission_attempted {
-                "provider_submission_attempted"
-            } else {
-                "provider_failure"
+        self.write_state_artifact_value(
+            run_id,
+            &StateArtifact {
+                provider: "pterodactyl",
+                workflow_stage: if submission_attempted {
+                    "provider_submission_attempted"
+                } else {
+                    "provider_failure"
+                },
+                current_state: None,
+                is_suspended: None,
+                is_limbo: None,
+                phase: None,
+                connection: None,
+                position: None,
+                total: None,
+                estimated_minutes: None,
+                blocked: None,
+                enabled: None,
+                wake_requested: false,
+                last_error: Some(error_class),
+                failed_stage: Some(if submission_attempted {
+                    "power_start"
+                } else {
+                    "provider"
+                }),
+                transport_category: None,
+                attempt_count: None,
+                timeout_ms: None,
+                elapsed_ms: None,
+                power_request_attempted: Some(submission_attempted),
+                power_submission_state: None,
+                power_confirmation_source: None,
             },
-            current_state: None,
-            is_suspended: None,
-            is_limbo: None,
-            phase: None,
-            connection: None,
-            position: None,
-            total: None,
-            estimated_minutes: None,
-            blocked: None,
-            enabled: None,
-            wake_requested: false,
-            last_error: Some(error_class),
-            power_submission_state: None,
-            power_confirmation_source: None,
-        };
-        let snapshot_path = self.artifact_dir.join(run_id).join(SNAPSHOT_ARTIFACT);
-        if !self.artifact_capture.capture_failure_screenshot() {
-            if let Err(error) = remove_snapshot_artifact_async(snapshot_path).await {
-                emit_snapshot_warning(run_id, &error);
-            }
-            return None;
-        }
-        self.write_snapshot_artifact(run_id, &artifact).await
-    }
-
-    async fn write_snapshot_artifact(
-        &self,
-        run_id: &str,
-        artifact: &StateArtifact<'_>,
-    ) -> Option<PathBuf> {
-        let run_dir = self.artifact_dir.join(run_id);
-        let snapshot_path = run_dir.join(SNAPSHOT_ARTIFACT);
-        let render_run_id = run_id.to_string();
-        let view = snapshot::SnapshotView::from_artifact(artifact);
-        let write_run_dir = run_dir.clone();
-        let write_snapshot_path = snapshot_path.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            mark_run_artifact_dir(&write_run_dir)?;
-            let bytes = snapshot::render_snapshot_view(&render_run_id, &view)?;
-            remove_snapshot_artifact(&write_snapshot_path)?;
-            write_owner_only_atomic(&write_snapshot_path, &bytes)
-        })
+        )
         .await
-        .context("provider snapshot artifact task failed")
-        .and_then(|result| result);
-        match result {
-            Ok(()) => Some(snapshot_path),
-            Err(error) => {
-                let _ = remove_snapshot_artifact_async(snapshot_path).await;
-                emit_snapshot_warning(run_id, &error);
-                None
-            }
-        }
     }
 }
 
 fn clearance_failure_is_retryable(failure: &ProviderStartFailure) -> bool {
     failure.error_class == "FlareSolverrUnavailable"
+}
+
+fn flaresolverr_runtime_failure(error: &anyhow::Error) -> ProviderStartFailure {
+    let detail = error.to_string();
+    let error_class = if detail.starts_with("FlareSolverrConfiguration") {
+        "FlareSolverrConfiguration"
+    } else {
+        "FlareSolverrUnavailable"
+    };
+    let mut failure = provider_failure(
+        error_class,
+        if error_class == "FlareSolverrConfiguration" {
+            "FlareSolverr is not configured safely"
+        } else {
+            "FlareSolverr could not be started for provider access"
+        },
+        None,
+        ProviderMutation::None,
+    );
+    failure.retryable = error_class == "FlareSolverrUnavailable";
+    failure
 }
 
 impl ServerStartProvider for PterodactylProvider {
@@ -1603,7 +1859,7 @@ impl PowerAttemptFailure {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Clearance {
     user_agent: HeaderValue,
     cookie_header: HeaderValue,
@@ -1679,9 +1935,29 @@ struct StateArtifact<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    failed_stage: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_category: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power_request_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     power_submission_state: Option<PowerSubmissionState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     power_confirmation_source: Option<PowerConfirmationSource>,
+}
+
+struct FailureArtifactDiagnostics<'a> {
+    failed_stage: &'a str,
+    transport_category: Option<&'a str>,
+    attempt_count: usize,
+    timeout_ms: u64,
+    elapsed_ms: u128,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1784,6 +2060,15 @@ fn sleep_status_allocation_ready(status: &PlaySleepStatus) -> bool {
         || status.phase.trim().eq_ignore_ascii_case("active")
 }
 
+fn allocation_status_supports_extension(status: &PlaySleepStatus) -> bool {
+    status.blocked != Some(true)
+        && status.enabled != Some(false)
+        && matches!(
+            status.phase.trim().to_ascii_lowercase().as_str(),
+            "queued" | "waking"
+        )
+}
+
 fn allocation_status_failure(status: &PlaySleepStatus) -> Option<(&'static str, &'static str)> {
     if status.enabled == Some(false) {
         return Some((
@@ -1861,7 +2146,7 @@ fn emit_allocation_progress(
             progress,
             ProviderProgressStage::WaitingForAllocation,
             format!(
-                "{}, waiting {}",
+                "{} Waited {} so far.",
                 allocation_status_detail(status),
                 terminal::format_duration(allocation_started_at.elapsed().as_millis())
             ),
@@ -1872,23 +2157,42 @@ fn emit_allocation_progress(
 }
 
 fn allocation_status_detail(status: &PlaySleepStatus) -> String {
-    let mut parts = vec![format!(
-        "phase {}",
-        status.phase.trim().to_ascii_lowercase()
-    )];
-    if let Some(position) = status.position {
-        parts.push(match status.total {
-            Some(total) => format!("queue {position}/{total}"),
-            None => format!("queue position {position}"),
-        });
+    let phase = status.phase.trim().to_ascii_lowercase();
+    let mut detail = match phase.as_str() {
+        "asleep" | "sleeping" | "suspended" => {
+            "Play Hosting is asleep. Waiting for it to assign a host.".to_string()
+        }
+        "queued" => match (status.position, status.total) {
+            (Some(position), Some(total)) => {
+                format!("In Play Hosting's queue: position {position} of {total}.")
+            }
+            (Some(position), None) => {
+                format!("In Play Hosting's queue at position {position}.")
+            }
+            _ => "In Play Hosting's allocation queue.".to_string(),
+        },
+        "waking" => "A host is waking up for the server.".to_string(),
+        "active" => "A host is ready for the server.".to_string(),
+        "attention" => "Play Hosting needs attention before allocation can continue.".to_string(),
+        _ => format!("Play Hosting reports allocation state '{phase}'."),
+    };
+    if phase == "waking"
+        && let Some(position) = status.position
+    {
+        match status.total {
+            Some(total) => {
+                detail.push_str(&format!(" Queue position: {position} of {total}."));
+            }
+            None => detail.push_str(&format!(" Queue position: {position}.")),
+        }
     }
     if let Some(minutes) = status.estimated_minutes {
-        parts.push(format!("estimated {minutes} minutes"));
+        detail.push_str(&format!(" Estimated wait: about {minutes} minutes."));
     }
     if status.blocked == Some(true) {
-        parts.push("blocked".to_string());
+        detail.push_str(" Allocation is blocked and needs attention.");
     }
-    parts.join(", ")
+    detail
 }
 
 fn allocation_timeout_detail(status: &PlaySleepStatus, last_error: Option<&str>) -> String {
@@ -2050,6 +2354,35 @@ impl ApiError {
         );
         failure.retryable = self.retryable;
         failure
+    }
+}
+
+fn classify_read_request_error(error: reqwest::Error) -> ApiError {
+    if error.is_timeout() {
+        return ApiError::transient("ProviderRequestTimeout", "Provider read request timed out");
+    }
+    if error.is_connect() {
+        return ApiError::transient(
+            "ProviderConnection",
+            "Provider read endpoint could not be reached",
+        );
+    }
+    ApiError::transient(
+        "ProviderTransport",
+        "Provider read request could not be completed",
+    )
+}
+
+fn post_allocation_resource_retry_category(failure: &ProviderStartFailure) -> Option<&'static str> {
+    if failure.uncertain_mutation != ProviderMutation::None || !failure.retryable {
+        return None;
+    }
+    match failure.error_class.as_str() {
+        "ProviderRequestTimeout" => Some("timeout"),
+        "ProviderConnection" => Some("connect"),
+        "ProviderRateLimited" => Some("rate_limited"),
+        "ProviderUnavailable" => Some("server_error"),
+        _ => None,
     }
 }
 
@@ -2231,6 +2564,8 @@ fn is_cloudflare_challenge(headers: &HeaderMap, body: &[u8]) -> bool {
 }
 
 enum LimitedBodyError {
+    Timeout,
+    Connect,
     Read,
     TooLarge,
 }
@@ -2246,7 +2581,15 @@ async fn limited_response_body(
         return Err(LimitedBodyError::TooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| LimitedBodyError::Read)? {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            LimitedBodyError::Timeout
+        } else if error.is_connect() {
+            LimitedBodyError::Connect
+        } else {
+            LimitedBodyError::Read
+        }
+    })? {
         if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
             return Err(LimitedBodyError::TooLarge);
         }
@@ -2259,9 +2602,17 @@ async fn response_body(response: Response) -> Result<Vec<u8>, ApiError> {
     limited_response_body(response, MAX_RESPONSE_BYTES)
         .await
         .map_err(|error| match error {
-            LimitedBodyError::Read => {
-                ApiError::transient("ProviderUnavailable", "Provider response could not be read")
+            LimitedBodyError::Timeout => {
+                ApiError::transient("ProviderRequestTimeout", "Provider response body timed out")
             }
+            LimitedBodyError::Connect => ApiError::transient(
+                "ProviderConnection",
+                "Provider connection closed while reading the response",
+            ),
+            LimitedBodyError::Read => ApiError::transient(
+                "ProviderResponseRead",
+                "Provider response could not be read",
+            ),
             LimitedBodyError::TooLarge => ApiError::definitive(
                 "ProviderProtocol",
                 "Provider response exceeded the allowed size",
@@ -2289,9 +2640,9 @@ fn provider_failure(
 fn set_failure_artifacts(
     failure: &mut ProviderStartFailure,
     detail_artifact_path: Option<PathBuf>,
-    fresh_detail_artifact_path: Option<&PathBuf>,
+    _fresh_detail_artifact_path: Option<&PathBuf>,
 ) {
-    failure.screenshot_path = snapshot_path_for_detail(fresh_detail_artifact_path);
+    failure.screenshot_path = None;
     failure.detail_artifact_path = detail_artifact_path;
 }
 
@@ -2302,30 +2653,6 @@ fn backfill_failure_artifacts(
     if failure.detail_artifact_path.is_none() {
         failure.detail_artifact_path = fallback_detail_artifact_path;
     }
-}
-
-fn snapshot_path_for_detail(detail_artifact_path: Option<&PathBuf>) -> Option<PathBuf> {
-    let path = detail_artifact_path?.parent()?.join(SNAPSHOT_ARTIFACT);
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    (metadata.file_type().is_file() && !metadata.file_type().is_symlink()).then_some(path)
-}
-
-fn remove_snapshot_artifact(path: &std::path::Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-            std::fs::remove_file(path)?;
-            Ok(())
-        }
-        Ok(_) => anyhow::bail!("snapshot path is not a regular file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-async fn remove_snapshot_artifact_async(path: PathBuf) -> Result<()> {
-    tokio::task::spawn_blocking(move || remove_snapshot_artifact(&path))
-        .await
-        .context("provider snapshot cleanup task failed")?
 }
 
 fn emit_state_artifact_warning(run_id: &str, error: &anyhow::Error) {
@@ -2341,40 +2668,6 @@ fn emit_state_artifact_warning(run_id: &str, error: &anyhow::Error) {
             terminal::clean(&error.to_string())
         ),
     ));
-}
-
-fn emit_snapshot_warning(run_id: &str, error: &anyhow::Error) {
-    terminal::emit(terminal::line(
-        "WARN",
-        "artifacts",
-        "",
-        "",
-        None,
-        format!(
-            "could not write provider snapshot for run {}; error {}",
-            run_id,
-            terminal::clean(&error.to_string())
-        ),
-    ));
-}
-
-fn should_capture_snapshot(
-    artifact_capture: ArtifactCapture,
-    artifact: &StateArtifact<'_>,
-) -> bool {
-    let failure = matches!(
-        artifact.power_submission_state,
-        Some(PowerSubmissionState::Ambiguous | PowerSubmissionState::Rejected)
-    ) || (artifact.last_error.is_some()
-        && !matches!(
-            artifact.power_submission_state,
-            Some(PowerSubmissionState::Confirmed)
-        ));
-    if failure {
-        artifact_capture.capture_failure_screenshot()
-    } else {
-        artifact_capture.capture_success_screenshot()
-    }
 }
 
 fn retryable_provider_failure(
@@ -2404,6 +2697,7 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -2449,8 +2743,42 @@ mod tests {
     async fn mock_api_with_delays(
         responses: Vec<(&'static str, StatusCode, &'static str, Duration)>,
     ) -> (Url, tokio::task::JoinHandle<()>) {
+        let (url, task, _) = mock_api_recording_with_delays(responses).await;
+        (url, task)
+    }
+
+    async fn mock_api_recording(
+        responses: Vec<(&'static str, StatusCode, &'static str)>,
+    ) -> (Url, tokio::task::JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
+        mock_api_recording_with_delays(
+            responses
+                .into_iter()
+                .map(|(request, status, body)| (request, status, body, Duration::ZERO))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn mock_api_recording_with_delays(
+        responses: Vec<(&'static str, StatusCode, &'static str, Duration)>,
+    ) -> (Url, tokio::task::JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
+        mock_api_recording_with_delay_mode(responses, false).await
+    }
+
+    async fn mock_api_recording_with_body_delays(
+        responses: Vec<(&'static str, StatusCode, &'static str, Duration)>,
+    ) -> (Url, tokio::task::JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
+        mock_api_recording_with_delay_mode(responses, true).await
+    }
+
+    async fn mock_api_recording_with_delay_mode(
+        responses: Vec<(&'static str, StatusCode, &'static str, Duration)>,
+        delay_body: bool,
+    ) -> (Url, tokio::task::JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let task_requests = Arc::clone(&requests);
         let task = tokio::spawn(async move {
             let mut responses = responses.into_iter().peekable();
             while let Some((expected_request_line, _, _, _)) = responses.peek() {
@@ -2459,6 +2787,7 @@ mod tests {
                 let size = stream.read(&mut request).await.unwrap();
                 let request = String::from_utf8_lossy(&request[..size]);
                 let request_line = request.lines().next().unwrap_or_default();
+                task_requests.lock().unwrap().push(request_line.to_string());
                 if request_line.contains("/activity?") && request_line != *expected_request_line {
                     let body = r#"{"data":[]}"#;
                     let response = format!(
@@ -2471,19 +2800,28 @@ mod tests {
                 }
                 let (expected_request_line, status, body, delay) = responses.next().unwrap();
                 assert_eq!(request_line, expected_request_line);
-                sleep(delay).await;
-
-                let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                let headers = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown"),
-                    body.len(),
-                    body
+                    body.len()
                 );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                if delay_body {
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    sleep(delay).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                } else {
+                    sleep(delay).await;
+                    let response = format!("{headers}{body}");
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
             }
         });
-        (Url::parse(&format!("http://{address}/")).unwrap(), task)
+        (
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            task,
+            requests,
+        )
     }
 
     fn test_config(panel_origin: Url, power_enabled: bool) -> PterodactylConfig {
@@ -2493,6 +2831,7 @@ mod tests {
             api_token: "test-token".to_string(),
             power_enabled,
             allocation_wait_secs: 720,
+            allocation_max_wait_secs: 1_800,
             flaresolverr_url: Url::parse("http://127.0.0.1:8191/").unwrap(),
             flaresolverr_container: "flaresolverr".to_string(),
             orbctl_path: PathBuf::from("/unused/orbctl"),
@@ -2508,6 +2847,7 @@ mod tests {
         let mut provider =
             PterodactylProvider::new(config, artifact_dir, artifact_capture).unwrap();
         provider.allocation_wait_interval = Duration::from_millis(1);
+        provider.post_allocation_resource_retry_interval = Duration::from_millis(1);
         provider
     }
 
@@ -2602,14 +2942,7 @@ mod tests {
 
         assert_eq!(result.outcome, StartOutcome::StartRequested);
         assert_eq!(result.minecraft_address.as_deref(), Some("server.example"));
-        let snapshot_path = result.screenshot_path.clone().expect("provider snapshot");
-        assert_eq!(
-            snapshot_path.file_name().and_then(|name| name.to_str()),
-            Some(SNAPSHOT_ARTIFACT)
-        );
-        let snapshot = image::open(&snapshot_path).unwrap();
-        assert_eq!(snapshot.width(), 1200);
-        assert_eq!(snapshot.height(), 675);
+        assert_eq!(result.screenshot_path, None);
         let artifact =
             std::fs::read_to_string(result.detail_artifact_path.expect("state artifact")).unwrap();
         assert!(artifact.contains(r#""workflow_stage": "power_start""#));
@@ -2653,8 +2986,43 @@ mod tests {
         let artifact = std::fs::read_to_string(path).unwrap();
 
         assert!(artifact.contains(r#""power_submission_state": "ambiguous""#));
+        assert!(artifact.contains(r#""power_request_attempted": true"#));
         assert!(artifact.contains("ProviderPowerTimeout"));
         assert!(!artifact.contains("test-token"));
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatching_power_artifact_does_not_claim_request_was_attempted() {
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-pterodactyl-dispatching-power-{}",
+            rand::random::<u64>()
+        ));
+        let provider = test_provider(
+            test_config(Url::parse("http://127.0.0.1:1/").unwrap(), true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+
+        let path = provider
+            .write_power_state_artifact(
+                "run-id",
+                PowerArtifactState {
+                    current_state: "offline",
+                    is_suspended: false,
+                    is_limbo: false,
+                    submission_state: PowerSubmissionState::Dispatching,
+                    allocation: None,
+                    last_error: None,
+                    confirmation_source: None,
+                },
+            )
+            .await
+            .unwrap();
+        let artifact = std::fs::read_to_string(path).unwrap();
+
+        assert!(artifact.contains(r#""power_submission_state": "dispatching""#));
+        assert!(!artifact.contains("power_request_attempted"));
         std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
@@ -2768,7 +3136,7 @@ mod tests {
         assert_eq!(result.outcome, StartOutcome::StartRequested);
         assert!(progress.iter().any(|item| {
             item.stage == ProviderProgressStage::WaitingForAllocation
-                && item.detail.contains("queue 1/8")
+                && item.detail.contains("Queue position: 1 of 8")
         }));
         assert!(
             progress
@@ -2776,6 +3144,593 @@ mod tests {
                 .any(|item| item.stage == ProviderProgressStage::RequestingPower)
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_allocation_resource_retries_do_not_replay_mutations() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":true,"status":"suspended"}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server, requests) = mock_api_recording(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"asleep","connection":null,"enabled":true}"#,
+            ),
+            (
+                "POST /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/wake HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example","enabled":true}"#,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::TOO_MANY_REQUESTS,
+                "{}",
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+            ),
+            (
+                "POST /api/client/servers/34634dd7/power HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.start_inner("run-id", None).await.unwrap();
+
+        assert_eq!(result.outcome, StartOutcome::StartRequested);
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/wake HTTP/1.1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/resources HTTP/1.1"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/power HTTP/1.1"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn post_allocation_state_conflict_does_not_replay_wake() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":true,"status":"suspended"}}"#;
+        let (panel_origin, server, requests) = mock_api_recording(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"asleep","connection":null,"enabled":true}"#,
+            ),
+            (
+                "POST /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/wake HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example","enabled":true}"#,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::CONFLICT,
+                "{}",
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let failure = provider.start_inner("run-id", None).await.unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderStateConflict");
+        assert_eq!(failure.uncertain_mutation, ProviderMutation::None);
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/wake HTTP/1.1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/power HTTP/1.1"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_post_allocation_resource_retries_do_not_send_power() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":true,"status":"suspended"}}"#;
+        let mut responses = vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"asleep","connection":null,"enabled":true}"#,
+            ),
+            (
+                "POST /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/wake HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example","enabled":true}"#,
+            ),
+        ];
+        for _ in 0..POST_ALLOCATION_RESOURCE_ATTEMPTS {
+            responses.push((
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+            ));
+        }
+        let (panel_origin, server, requests) = mock_api_recording(responses).await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-provider-controls-failure-{}",
+            rand::random::<u64>()
+        ));
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let failure = provider
+            .start_inner("run-id", Some(&progress_tx))
+            .await
+            .unwrap_err();
+        drop(progress_tx);
+
+        assert_eq!(failure.error_class, "ProviderControlsUnavailable");
+        assert_eq!(failure.uncertain_mutation, ProviderMutation::None);
+        assert!(failure.retryable);
+        let mut progress = Vec::new();
+        while let Ok(item) = progress_rx.try_recv() {
+            progress.push(item);
+        }
+        assert!(
+            !progress
+                .iter()
+                .any(|item| item.stage == ProviderProgressStage::RequestingPower)
+        );
+        let artifact = std::fs::read_to_string(
+            failure
+                .detail_artifact_path
+                .as_ref()
+                .expect("failure artifact"),
+        )
+        .unwrap();
+        assert!(artifact.contains(r#""workflow_stage": "provider_controls""#));
+        assert!(artifact.contains(r#""failed_stage": "post_allocation_resources""#));
+        assert!(artifact.contains(r#""transport_category": "server_error""#));
+        assert!(artifact.contains(r#""attempt_count": 3"#));
+        assert!(artifact.contains(r#""timeout_ms": 15000"#));
+        assert!(artifact.contains(r#""power_request_attempted": false"#));
+        assert!(!artifact.contains("test-token"));
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/wake HTTP/1.1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/resources HTTP/1.1"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/power HTTP/1.1"))
+                .count(),
+            0
+        );
+        drop(requests);
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_allocation_resource_timeouts_are_classified_and_bounded() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let mut responses = vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example","enabled":true}"#,
+                Duration::ZERO,
+            ),
+        ];
+        for _ in 0..POST_ALLOCATION_RESOURCE_ATTEMPTS {
+            responses.push((
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+                Duration::from_millis(30),
+            ));
+        }
+        let (panel_origin, server, requests) = mock_api_recording_with_delays(responses).await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-provider-controls-timeout-{}",
+            rand::random::<u64>()
+        ));
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+        provider.api_client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_millis(5))
+            .build()
+            .unwrap();
+
+        let failure = provider.start_inner("run-id", None).await.unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderControlsTimeout");
+        let artifact = std::fs::read_to_string(
+            failure
+                .detail_artifact_path
+                .as_ref()
+                .expect("failure artifact"),
+        )
+        .unwrap();
+        assert!(artifact.contains(r#""transport_category": "timeout""#));
+        assert!(artifact.contains(r#""attempt_count": 3"#));
+        assert!(artifact.contains(r#""power_request_attempted": false"#));
+        server.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/resources HTTP/1.1"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/power HTTP/1.1"))
+                .count(),
+            0
+        );
+        drop(requests);
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resource_body_timeout_uses_the_retryable_timeout_category() {
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server, _) = mock_api_recording_with_body_delays(vec![(
+            "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+            StatusCode::OK,
+            resources,
+            Duration::from_millis(30),
+        )])
+        .await;
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+        provider.api_client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_millis(5))
+            .build()
+            .unwrap();
+
+        let failure = provider.resources_with_refresh().await.unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderRequestTimeout");
+        assert_eq!(
+            post_allocation_resource_retry_category(&failure),
+            Some("timeout")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_queued_allocation_extends_once_to_hard_deadline() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example","enabled":true}"#,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+            ),
+            (
+                "POST /api/client/servers/34634dd7/power HTTP/1.1",
+                StatusCode::NO_CONTENT,
+                "",
+            ),
+        ])
+        .await;
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+        provider.allocation_wait_timeout = Duration::ZERO;
+        provider.allocation_max_wait_timeout = Duration::from_millis(50);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = provider
+            .start_inner("run-id", Some(&progress_tx))
+            .await
+            .unwrap();
+        drop(progress_tx);
+
+        assert_eq!(result.outcome, StartOutcome::StartRequested);
+        let mut progress = Vec::new();
+        while let Ok(item) = progress_rx.try_recv() {
+            progress.push(item);
+        }
+        assert!(
+            progress
+                .iter()
+                .any(|item| item.detail.contains("Extending the wait"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocation_poll_timeout_suppresses_extension() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let (panel_origin, server) = mock_api_with_delays(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+                Duration::ZERO,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+                Duration::from_millis(200),
+            ),
+        ])
+        .await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-allocation-poll-timeout-{}",
+            rand::random::<u64>()
+        ));
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+        provider.allocation_wait_timeout = Duration::from_millis(100);
+        provider.allocation_max_wait_timeout = Duration::from_millis(300);
+        provider.allocation_wait_interval = Duration::ZERO;
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let failure = provider
+            .start_inner("run-id", Some(&progress_tx))
+            .await
+            .unwrap_err();
+        drop(progress_tx);
+
+        assert_eq!(failure.error_class, "ProviderAllocationTimeout");
+        let mut progress = Vec::new();
+        while let Ok(item) = progress_rx.try_recv() {
+            progress.push(item);
+        }
+        assert!(
+            !progress
+                .iter()
+                .any(|item| item.detail.contains("Extending the wait"))
+        );
+        let artifact = std::fs::read_to_string(
+            failure
+                .detail_artifact_path
+                .as_ref()
+                .expect("failure artifact"),
+        )
+        .unwrap();
+        assert!(artifact.contains(r#""transport_category": "timeout""#));
+        assert!(artifact.contains(r#""attempt_count": 2"#));
+        server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_allocation_never_moves_past_hard_deadline() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let mut responses = vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+            ),
+        ];
+        for _ in 0..64 {
+            responses.push((
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+            ));
+        }
+        let (panel_origin, server, requests) = mock_api_recording(responses).await;
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+        provider.allocation_wait_timeout = Duration::ZERO;
+        provider.allocation_max_wait_timeout = Duration::from_millis(10);
+        provider.allocation_wait_interval = Duration::from_millis(1);
+        let started_at = Instant::now();
+
+        let failure = provider.start_inner("run-id", None).await.unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderAllocationTimeout");
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/wake HTTP/1.1"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|line| line.contains("/power HTTP/1.1"))
+                .count(),
+            0
+        );
+        drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn extended_allocation_stops_after_bounded_poll_errors() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let mut responses = vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"queued","connection":null,"blocked":false,"enabled":true}"#,
+            ),
+        ];
+        for _ in 0..ALLOCATION_EXTENSION_ERROR_LIMIT {
+            responses.push((
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+            ));
+        }
+        let (panel_origin, server) = mock_api(responses).await;
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "butler-allocation-extension-errors-{}",
+            rand::random::<u64>()
+        ));
+        let mut provider = test_provider(
+            test_config(panel_origin, true),
+            artifact_dir.clone(),
+            ArtifactCapture::Screenshots,
+        );
+        provider.allocation_wait_timeout = Duration::ZERO;
+        provider.allocation_max_wait_timeout = Duration::from_millis(500);
+        let started_at = Instant::now();
+
+        let failure = provider.start_inner("run-id", None).await.unwrap_err();
+
+        assert_eq!(failure.error_class, "ProviderAllocationTimeout");
+        assert!(started_at.elapsed() < Duration::from_millis(200));
+        let artifact = std::fs::read_to_string(
+            failure
+                .detail_artifact_path
+                .as_ref()
+                .expect("failure artifact"),
+        )
+        .unwrap();
+        assert!(artifact.contains(r#""transport_category": "server_error""#));
+        assert!(artifact.contains(r#""attempt_count": 4"#));
+        server.await.unwrap();
+        std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2804,14 +3759,15 @@ mod tests {
             ArtifactCapture::Screenshots,
         );
         provider.allocation_wait_timeout = Duration::from_millis(1);
+        provider.allocation_max_wait_timeout = Duration::from_millis(1);
 
         let failure = provider.start_inner("run-id", None).await.unwrap_err();
 
         assert_eq!(failure.error_class, "ProviderAllocationTimeout");
-        assert_eq!(failure.uncertain_mutation, ProviderMutation::WakeAllocation);
+        assert_eq!(failure.uncertain_mutation, ProviderMutation::None);
         assert!(!failure.uncertain_mutation.may_have_started_server());
-        assert!(failure.message.contains("phase queued"));
-        assert!(failure.message.contains("queue 1/4"));
+        assert!(failure.message.contains("Play Hosting's queue"));
+        assert!(failure.message.contains("position 1 of 4"));
         let artifact = std::fs::read_to_string(
             failure
                 .detail_artifact_path
@@ -2820,8 +3776,10 @@ mod tests {
         )
         .unwrap();
         assert!(artifact.contains(r#""workflow_stage": "allocation""#));
+        assert!(artifact.contains(r#""failed_stage": "allocation""#));
         assert!(artifact.contains(r#""phase": "queued""#));
         assert!(artifact.contains(r#""position": 1"#));
+        assert!(artifact.contains(r#""power_request_attempted": false"#));
         assert!(!artifact.contains("test-token"));
         assert!(!artifact.contains("cf_clearance"));
         server.await.unwrap();
@@ -2916,8 +3874,49 @@ mod tests {
 
         let result = provider.check("check1").await.unwrap();
 
-        assert_eq!(result.provider_status, "Allocation queued");
+        assert_eq!(
+            result.provider_status,
+            "In Play Hosting's queue: position 3 of 8."
+        );
         assert_eq!(result.minecraft_address, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_check_preserves_active_allocation_context_when_process_is_offline() {
+        let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
+        let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
+        let (panel_origin, server) = mock_api(vec![
+            (
+                "GET /api/client/servers/34634dd7 HTTP/1.1",
+                StatusCode::OK,
+                details,
+            ),
+            (
+                "GET /api/client/servers/34634dd7-e564-480e-a3a7-84baf53c9328/sleep-status HTTP/1.1",
+                StatusCode::OK,
+                r#"{"phase":"active","connection":"server.example"}"#,
+            ),
+            (
+                "GET /api/client/servers/34634dd7/resources HTTP/1.1",
+                StatusCode::OK,
+                resources,
+            ),
+        ])
+        .await;
+        let provider = test_provider(
+            test_config(panel_origin, true),
+            PathBuf::from("unused"),
+            ArtifactCapture::Off,
+        );
+
+        let result = provider.check("check1").await.unwrap();
+
+        assert_eq!(
+            result.provider_status,
+            "A host is allocated, but the Minecraft server process is offline."
+        );
+        assert_eq!(result.minecraft_address.as_deref(), Some("server.example"));
         server.await.unwrap();
     }
 
@@ -3470,6 +4469,58 @@ mod tests {
         assert_eq!(read_retry.uncertain_mutation, ProviderMutation::None);
     }
 
+    #[test]
+    fn post_allocation_retry_predicate_is_read_only_and_allowlisted() {
+        for (class, expected) in [
+            ("ProviderRequestTimeout", Some("timeout")),
+            ("ProviderConnection", Some("connect")),
+            ("ProviderRateLimited", Some("rate_limited")),
+            ("ProviderUnavailable", Some("server_error")),
+            ("ProviderAuthentication", None),
+            ("ProviderAuthorization", None),
+            ("ProviderProtocol", None),
+            ("ProviderStateConflict", None),
+            ("FlareSolverrUnavailable", None),
+        ] {
+            let mut failure = provider_failure(class, "test", None, ProviderMutation::None);
+            failure.retryable = true;
+            assert_eq!(post_allocation_resource_retry_category(&failure), expected);
+        }
+
+        let mut mutation = provider_failure(
+            "ProviderUnavailable",
+            "test",
+            None,
+            ProviderMutation::WakeAllocation,
+        );
+        mutation.retryable = true;
+        assert_eq!(post_allocation_resource_retry_category(&mutation), None);
+    }
+
+    #[test]
+    fn allocation_extension_requires_healthy_queue_progress() {
+        let mut status = PlaySleepStatus {
+            phase: "queued".to_string(),
+            connection: None,
+            position: Some(2),
+            total: Some(8),
+            estimated_minutes: Some(5),
+            blocked: Some(false),
+            enabled: Some(true),
+        };
+        assert!(allocation_status_supports_extension(&status));
+        status.phase = "waking".to_string();
+        assert!(allocation_status_supports_extension(&status));
+        status.phase = "asleep".to_string();
+        assert!(!allocation_status_supports_extension(&status));
+        status.phase = "queued".to_string();
+        status.blocked = Some(true);
+        assert!(!allocation_status_supports_extension(&status));
+        status.blocked = Some(false);
+        status.enabled = Some(false);
+        assert!(!allocation_status_supports_extension(&status));
+    }
+
     #[tokio::test]
     async fn connection_failures_are_definitively_pre_submission() {
         let error = Client::new()
@@ -3583,50 +4634,8 @@ mod tests {
         assert!(!message.contains("secret"));
     }
 
-    #[test]
-    fn snapshot_capture_policy_distinguishes_success_and_failure() {
-        let mut artifact = StateArtifact {
-            provider: "pterodactyl",
-            workflow_stage: "power_start",
-            current_state: Some("offline"),
-            is_suspended: Some(false),
-            is_limbo: Some(true),
-            phase: Some("active"),
-            connection: Some("server.example"),
-            position: None,
-            total: None,
-            estimated_minutes: None,
-            blocked: Some(false),
-            enabled: Some(true),
-            wake_requested: true,
-            last_error: None,
-            power_submission_state: Some(PowerSubmissionState::Confirmed),
-            power_confirmation_source: Some(PowerConfirmationSource::Response),
-        };
-
-        assert!(should_capture_snapshot(
-            ArtifactCapture::Screenshots,
-            &artifact
-        ));
-        assert!(!should_capture_snapshot(
-            ArtifactCapture::Failure,
-            &artifact
-        ));
-        assert!(!should_capture_snapshot(ArtifactCapture::Off, &artifact));
-
-        artifact.last_error = Some("ProviderPowerTimeout");
-        assert!(!should_capture_snapshot(
-            ArtifactCapture::Failure,
-            &artifact
-        ));
-
-        artifact.power_submission_state = Some(PowerSubmissionState::Rejected);
-        artifact.last_error = Some("ProviderPowerRejected");
-        assert!(should_capture_snapshot(ArtifactCapture::Failure, &artifact));
-    }
-
     #[tokio::test]
-    async fn terminal_provider_failure_has_valid_snapshot() {
+    async fn terminal_provider_failure_writes_state_without_screenshot() {
         let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":true,"is_limbo":false,"status":"suspended"}}"#;
         let (panel_origin, server) = mock_api(vec![(
             "GET /api/client/servers/34634dd7 HTTP/1.1",
@@ -3635,7 +4644,7 @@ mod tests {
         )])
         .await;
         let artifact_dir = std::env::temp_dir().join(format!(
-            "butler-provider-failure-snapshot-{}",
+            "butler-provider-failure-state-{}",
             rand::random::<u64>()
         ));
         let provider = test_provider(
@@ -3650,15 +4659,21 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(failure.error_class, "ProviderSuspended");
-        let snapshot = failure.screenshot_path.expect("failure snapshot");
-        let image = image::open(snapshot).unwrap();
-        assert_eq!((image.width(), image.height()), (1200, 675));
+        assert_eq!(failure.screenshot_path, None);
+        let detail = std::fs::read_to_string(
+            failure
+                .detail_artifact_path
+                .expect("provider failure state artifact"),
+        )
+        .unwrap();
+        assert!(detail.contains(r#""workflow_stage": "provider_state""#));
+        assert!(detail.contains(r#""is_suspended": true"#));
         server.await.unwrap();
         std::fs::remove_dir_all(artifact_dir).unwrap();
     }
 
     #[tokio::test]
-    async fn snapshot_capture_modes_remove_stale_images() {
+    async fn pterodactyl_capture_modes_write_only_state_json() {
         let artifact = StateArtifact {
             provider: "pterodactyl",
             workflow_stage: "provider_state",
@@ -3674,14 +4689,20 @@ mod tests {
             enabled: None,
             wake_requested: false,
             last_error: None,
+            failed_stage: None,
+            transport_category: None,
+            attempt_count: None,
+            timeout_ms: None,
+            elapsed_ms: None,
+            power_request_attempted: None,
             power_submission_state: None,
             power_confirmation_source: None,
         };
 
-        for (capture, expected) in [
+        for (capture, expected_state) in [
             (ArtifactCapture::Screenshots, true),
             (ArtifactCapture::Full, true),
-            (ArtifactCapture::Failure, false),
+            (ArtifactCapture::Failure, true),
             (ArtifactCapture::Off, false),
         ] {
             let artifact_dir = std::env::temp_dir().join(format!(
@@ -3694,30 +4715,23 @@ mod tests {
                 capture,
             );
             let run_dir = artifact_dir.join("run-id");
-            mark_run_artifact_dir(&run_dir).unwrap();
-            std::fs::write(run_dir.join(SNAPSHOT_ARTIFACT), b"stale").unwrap();
 
             let detail = provider
                 .write_state_artifact_value("run-id", &artifact)
                 .await;
-            let snapshot = run_dir.join(SNAPSHOT_ARTIFACT);
 
-            assert_eq!(detail.is_some(), capture != ArtifactCapture::Off);
-            assert_eq!(snapshot.is_file(), expected);
-            if expected {
-                let image = image::open(&snapshot).unwrap();
-                assert_eq!((image.width(), image.height()), (1200, 675));
+            assert_eq!(detail.is_some(), expected_state);
+            assert_eq!(run_dir.join(STATE_ARTIFACT).is_file(), expected_state);
+            assert!(!run_dir.join("provider_snapshot.png").exists());
+            if artifact_dir.exists() {
+                std::fs::remove_dir_all(artifact_dir).unwrap();
             }
-            std::fs::remove_dir_all(artifact_dir).unwrap();
         }
     }
 
     #[tokio::test]
-    async fn service_verification_replaces_attempted_snapshot_with_confirmed_state() {
-        for (capture, expected_snapshot) in [
-            (ArtifactCapture::Screenshots, true),
-            (ArtifactCapture::Failure, false),
-        ] {
+    async fn service_verification_replaces_attempted_state_without_screenshot() {
+        for capture in [ArtifactCapture::Screenshots, ArtifactCapture::Failure] {
             let artifact_dir = std::env::temp_dir().join(format!(
                 "butler-provider-service-verification-{}",
                 rand::random::<u64>()
@@ -3728,7 +4742,7 @@ mod tests {
                 capture,
             );
             let attempted = provider
-                .write_terminal_failure_snapshot(
+                .write_terminal_failure_artifact(
                     "run-id",
                     "ProviderPowerTimeout",
                     ProviderMutation::PowerStart,
@@ -3743,13 +4757,12 @@ mod tests {
                     "online",
                 )
                 .await;
-            assert_eq!(confirmed.is_some(), expected_snapshot);
-            assert_eq!(
-                artifact_dir
+            assert_eq!(confirmed, None);
+            assert!(
+                !artifact_dir
                     .join("run-id")
-                    .join(SNAPSHOT_ARTIFACT)
-                    .is_file(),
-                expected_snapshot
+                    .join("provider_snapshot.png")
+                    .exists()
             );
             let detail =
                 std::fs::read_to_string(artifact_dir.join("run-id").join(STATE_ARTIFACT)).unwrap();

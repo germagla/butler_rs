@@ -91,7 +91,7 @@ acquire_start_admission_lock() {
         if /bin/kill -0 "$LOCK_PID" 2>/dev/null; then
             RUN_ID=$(/usr/bin/head -n 1 "$ACTIVE_START_MARKER" 2>/dev/null \
                 | /usr/bin/tr -cd 'A-Za-z0-9_-' || true)
-            echo "Butler start run ${RUN_ID:-unknown} is active; retry installation after it finishes." >&2
+            echo "Butler provider operation ${RUN_ID:-unknown} is active; retry installation after it finishes." >&2
             exit 1
         fi
         CURRENT_LOCK_OWNER=$(/bin/cat "$START_ADMISSION_LOCK" 2>/dev/null || true)

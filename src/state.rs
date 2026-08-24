@@ -49,6 +49,11 @@ pub struct ProviderOperationGuard {
     tracker: Arc<ProviderOperationTracker>,
 }
 
+pub struct ReadOnlyProviderOperationLease {
+    _admission_lease: StartAdmissionFileLease,
+    _provider_operation_guard: ProviderOperationGuard,
+}
+
 #[derive(Default)]
 struct ProviderOperationTracker {
     active: AtomicUsize,
@@ -116,6 +121,7 @@ pub struct BotState {
     minecraft_address: Arc<RwLock<String>>,
     provider_operations: Arc<ProviderOperationTracker>,
     accepting_starts: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 }
 
 impl BotState {
@@ -200,6 +206,7 @@ impl BotState {
             minecraft_address: Arc::new(RwLock::new(minecraft_address)),
             provider_operations: Arc::new(ProviderOperationTracker::default()),
             accepting_starts: Arc::new(AtomicBool::new(true)),
+            shutdown_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -218,10 +225,40 @@ impl BotState {
     pub async fn begin_shutdown(&self) {
         let _active = self.active_start_run.lock().await;
         self.accepting_starts.store(false, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
     }
 
     pub async fn wait_for_provider_operations(&self, duration: Duration) -> bool {
         self.provider_operations.wait_for_idle(duration).await
+    }
+
+    pub(crate) fn begin_background_operation(&self) -> ProviderOperationGuard {
+        self.provider_operations.begin()
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        !self.accepting_starts.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shutdown_notified(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.shutdown_notify.clone().notified_owned()
+    }
+
+    pub async fn try_begin_read_only_provider_operation(
+        &self,
+        run_id: &str,
+    ) -> Result<ReadOnlyProviderOperationLease> {
+        let _admission_gate = self.active_start_run.lock().await;
+        if !self.accepting_starts.load(Ordering::Acquire) {
+            anyhow::bail!("Butler is shutting down");
+        }
+        let admission_lease = StartAdmissionFileLease::acquire(&self.config.artifact_dir, run_id)?;
+        Ok(ReadOnlyProviderOperationLease {
+            _admission_lease: admission_lease,
+            _provider_operation_guard: self.provider_operations.begin(),
+        })
     }
 
     pub async fn try_begin_start_run(

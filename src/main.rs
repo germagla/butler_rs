@@ -60,10 +60,28 @@ async fn main() -> anyhow::Result<()> {
         }
         CliCommand::RunBot => {}
     }
+    if let config::ProviderConfig::Pterodactyl(provider_config) = &config.provider
+        && let Err(error) = pterodactyl::FlareSolverrSupervisor::reconcile_stale_ownership(
+            pterodactyl::FlareSolverrRuntimeConfig::new(provider_config, &config.artifact_dir),
+        )
+        .await
+    {
+        terminal::emit(terminal::line(
+            "WARN",
+            "flaresolverr",
+            "",
+            "",
+            None,
+            format!(
+                "could not reconcile stale owned container; error {}",
+                terminal::clean(&error.to_string())
+            ),
+        ));
+    }
     let provider = build_provider(&config)?;
     let provider_shutdown_wait_secs = match &config.provider {
         config::ProviderConfig::Pterodactyl(provider_config) => {
-            provider_config.allocation_wait_secs
+            provider_config.allocation_max_wait_secs
         }
         config::ProviderConfig::Aternos(_) => 0,
     }
@@ -82,28 +100,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let shard_manager = client.shard_manager.clone();
     let mut shutdown = Box::pin(shutdown_signal());
-    let supervisor = match &config.provider {
-        config::ProviderConfig::Pterodactyl(provider_config) => {
-            let mut startup = tokio::spawn(pterodactyl::FlareSolverrSupervisor::start(
-                pterodactyl::FlareSolverrRuntimeConfig::new(provider_config, &config.artifact_dir),
-            ));
-            tokio::select! {
-                result = &mut startup => Some(
-                    result.context("FlareSolverr supervisor startup task failed")??
-                ),
-                signal_result = &mut shutdown => {
-                    signal_result?;
-                    shutdown_state.begin_shutdown().await;
-                    shard_manager.shutdown_all().await;
-                    if let Ok(Ok(supervisor)) = startup.await {
-                        supervisor.shutdown().await;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-        config::ProviderConfig::Aternos(_) => None,
-    };
 
     let client_result: anyhow::Result<()> = tokio::select! {
         result = client.start() => result.map_err(Into::into),
@@ -127,11 +123,8 @@ async fn main() -> anyhow::Result<()> {
             "",
             "",
             None,
-            "timed out waiting for an active provider operation",
+            "timed out waiting for an active provider or verification operation",
         ));
-    }
-    if let Some(supervisor) = supervisor {
-        supervisor.shutdown().await;
     }
     client_result?;
 
@@ -240,23 +233,6 @@ async fn run_provider_cli(command: CliCommand, config: config::Config) -> anyhow
         CliCommand::ProviderCheck => None,
         _ => unreachable!("provider CLI runner requires a provider command"),
     };
-    let supervisor = if preflight.is_none() {
-        match &config.provider {
-            config::ProviderConfig::Pterodactyl(provider_config) => Some(
-                pterodactyl::FlareSolverrSupervisor::ensure_for_operation(
-                    pterodactyl::FlareSolverrRuntimeConfig::new(
-                        provider_config,
-                        &config.artifact_dir,
-                    ),
-                )
-                .await?,
-            ),
-            config::ProviderConfig::Aternos(_) => None,
-        }
-    } else {
-        None
-    };
-
     let result = if command == CliCommand::ProviderStartOnce && interrupted.load(Ordering::Acquire)
     {
         Err(interrupted_before_mutation_failure())
@@ -320,9 +296,6 @@ async fn run_provider_cli(command: CliCommand, config: config::Config) -> anyhow
         }
     };
 
-    if let Some(supervisor) = supervisor {
-        supervisor.shutdown().await;
-    }
     interrupt_task.abort();
     if let Err(error) =
         run_history::prune_run_artifact_dirs(&config.artifact_dir, config.run_history_limit)

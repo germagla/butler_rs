@@ -1,3 +1,4 @@
+use super::background_verification;
 use crate::{
     framework::Context,
     run_history::{RunContext, RunEvent, RunStep, RunSummary, now_ms},
@@ -21,6 +22,10 @@ impl<'a> RunTracker<'a> {
             started_at_ms: now_ms(),
             steps: Vec::new(),
         }
+    }
+
+    pub(super) fn started_at_ms(&self) -> u128 {
+        self.started_at_ms
     }
 
     pub(super) async fn step(
@@ -84,8 +89,51 @@ impl<'a> RunTracker<'a> {
         screenshot_path: Option<PathBuf>,
         error_class: Option<String>,
     ) {
+        let summary = self.completed_summary(
+            outcome,
+            final_provider_status,
+            final_minecraft_status,
+            screenshot_path,
+            error_class,
+        );
+        emit_summary(&summary);
+        self.ctx.data().run_store.push(summary).await;
+    }
+
+    pub(super) fn finish_with_background(
+        &mut self,
+        outcome: &str,
+        final_provider_status: Option<String>,
+        final_minecraft_status: Option<String>,
+        screenshot_path: Option<PathBuf>,
+        error_class: Option<String>,
+        background_job: background_verification::ReservedJob,
+    ) -> tokio::task::JoinHandle<()> {
+        let summary = self.completed_summary(
+            outcome,
+            final_provider_status,
+            final_minecraft_status,
+            screenshot_path,
+            error_class,
+        );
+        emit_summary(&summary);
+        let run_store = self.ctx.data().run_store.clone();
+        tokio::spawn(async move {
+            run_store.push(summary).await;
+            background_job.spawn();
+        })
+    }
+
+    fn completed_summary(
+        &self,
+        outcome: &str,
+        final_provider_status: Option<String>,
+        final_minecraft_status: Option<String>,
+        screenshot_path: Option<PathBuf>,
+        error_class: Option<String>,
+    ) -> RunSummary {
         let finished_at_ms = now_ms();
-        let summary = RunSummary {
+        RunSummary {
             context: self.context.clone(),
             started_at_ms: self.started_at_ms,
             finished_at_ms,
@@ -96,14 +144,15 @@ impl<'a> RunTracker<'a> {
             screenshot_path: screenshot_path.map(|path| path.display().to_string()),
             error_class,
             steps: self.steps.clone(),
-        };
-        if summary.error_class.as_deref() != Some("CommandError") {
-            let label = run_result_label(&summary);
-            let line =
-                terminal::line_for_context(label, &summary.context, run_summary_detail(&summary));
-            terminal::emit(line);
         }
-        self.ctx.data().run_store.push(summary).await;
+    }
+}
+
+fn emit_summary(summary: &RunSummary) {
+    if summary.error_class.as_deref() != Some("CommandError") {
+        let label = run_result_label(summary);
+        let line = terminal::line_for_context(label, &summary.context, run_summary_detail(summary));
+        terminal::emit(line);
     }
 }
 

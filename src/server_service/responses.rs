@@ -12,7 +12,10 @@ pub(super) struct StartMessage {
 }
 
 pub(super) fn start_progress_content(run_id: &str, notice: Option<&str>) -> String {
-    with_notice(format!("Starting server...\nRun: `{run_id}`"), notice)
+    with_notice(
+        format!("Checking Minecraft and the hosting provider...\nRun: `{run_id}`"),
+        notice,
+    )
 }
 
 pub(super) fn start_final_content(
@@ -21,14 +24,66 @@ pub(super) fn start_final_content(
     provider_status: &str,
     outcome: &str,
 ) -> String {
-    let headline = match outcome {
-        "MinecraftOnline" => "Server is online.",
-        "WaitOnlineTimeout" => {
-            "The provider accepted the start, but Minecraft did not report online before timeout."
+    let normalized_status = provider_status.trim().to_ascii_lowercase();
+    let headline = match (outcome, normalized_status.as_str()) {
+        ("AlreadyActive", "running" | "online") => "The server is already running.",
+        ("AlreadyActive", "starting") => "The server is already starting.",
+        ("StartRequested", "running" | "online") if provider_name == "pterodactyl" => {
+            "Start accepted. The server process is running."
+        }
+        ("StartRequested", _) if provider_name == "pterodactyl" => {
+            "Start accepted. Play Hosting is starting the server."
+        }
+        ("MinecraftOnline", _) => "Minecraft is online.",
+        ("WaitOnlineTimeout", _) if provider_name == "pterodactyl" => {
+            "Play Hosting accepted the start, but Minecraft is still not online."
+        }
+        ("WaitOnlineTimeout", _) => {
+            "The hosting provider accepted the start, but Minecraft is still not online."
         }
         _ => "Start accepted.",
     };
-    format!("{headline}\nProvider ({provider_name}): **{provider_status}**\nRun: `{run_id}`")
+    let (provider_label, state_description) =
+        if provider_name == "pterodactyl" && outcome == "MinecraftOnline" {
+            (
+            "Confirmation",
+            match normalized_status.as_str() {
+                "running" | "online" => {
+                    "Play Hosting reports the server process is running, and Minecraft is online."
+                        .to_string()
+                }
+                "starting" => {
+                    "Play Hosting was still reporting startup, but Minecraft is now online."
+                        .to_string()
+                }
+                _ => {
+                    "Minecraft is online. Play Hosting's last state was not recognized.".to_string()
+                }
+            },
+        )
+        } else if provider_name == "pterodactyl" {
+            (
+                "Play Hosting state",
+                pterodactyl_status_description(provider_status),
+            )
+        } else {
+            ("Provider state", provider_status.to_string())
+        };
+    format!("{headline}\n{provider_label}: **{state_description}**\nRun: `{run_id}`")
+}
+
+pub(super) fn pterodactyl_status_description(provider_status: &str) -> String {
+    match provider_status.trim().to_ascii_lowercase().as_str() {
+        "start requested" => {
+            "Start accepted; Play Hosting should now move the server through its startup states."
+                .to_string()
+        }
+        "running" | "online" => "The server process is running.".to_string(),
+        "starting" => "The server process is starting and is not ready to join yet.".to_string(),
+        "offline" | "stopped" => "The server process is offline.".to_string(),
+        "suspended" => "The server is suspended and Play Hosting cannot start it yet.".to_string(),
+        _ => "Play Hosting returned an unrecognized server state.".to_string(),
+    }
 }
 
 pub(super) fn with_notice(content: String, notice: Option<&str>) -> String {
@@ -126,6 +181,7 @@ pub(super) async fn send_with_optional_screenshot(
                         poise::CreateReply::default()
                             .content(content.clone())
                             .attachment(attachment)
+                            .allowed_mentions(disabled_mentions())
                             .ephemeral(ephemeral),
                     )
                     .await;
@@ -149,6 +205,7 @@ pub(super) async fn send_text(
     ctx.send(
         poise::CreateReply::default()
             .content(content.into())
+            .allowed_mentions(disabled_mentions())
             .ephemeral(ephemeral),
     )
     .await?;
@@ -180,7 +237,7 @@ fn emit_attachment_warning(path: &Path, error: &str) {
     ));
 }
 
-fn disabled_mentions() -> serenity::CreateAllowedMentions {
+pub(super) fn disabled_mentions() -> serenity::CreateAllowedMentions {
     serenity::CreateAllowedMentions::new()
         .all_users(false)
         .all_roles(false)
@@ -192,7 +249,7 @@ pub(super) fn format_run_detail(run: &RunSummary) -> String {
     let mut lines = vec![
         format!("Run `{}`", run.context.run_id),
         format!("Command: `{}`", run.context.command),
-        format!("Outcome: **{}**", run.outcome),
+        format!("Outcome: **{}**", run.display_outcome()),
         format!(
             "User: `{}` (`{}`)",
             run.context.user_name, run.context.user_id
@@ -284,5 +341,46 @@ mod tests {
         assert_eq!(attachable_screenshot_path(false, Some(path.clone())), None);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pterodactyl_final_copy_describes_dashboard_state() {
+        assert_eq!(
+            start_final_content("abc123", "pterodactyl", "Start requested", "StartRequested"),
+            "Start accepted. Play Hosting is starting the server.\nPlay Hosting state: **Start accepted; Play Hosting should now move the server through its startup states.**\nRun: `abc123`"
+        );
+        assert!(
+            start_final_content("abc123", "pterodactyl", "Running", "AlreadyActive")
+                .starts_with("The server is already running.")
+        );
+        assert!(
+            start_final_content("abc123", "pterodactyl", "Starting", "AlreadyActive")
+                .starts_with("The server is already starting.")
+        );
+        assert!(
+            start_final_content("abc123", "pterodactyl", "Running", "StartRequested")
+                .starts_with("Start accepted. The server process is running.")
+        );
+        let online = start_final_content("abc123", "pterodactyl", "Starting", "MinecraftOnline");
+        assert!(online.starts_with("Minecraft is online."));
+        assert!(online.contains(
+            "Confirmation: **Play Hosting was still reporting startup, but Minecraft is now online.**"
+        ));
+    }
+
+    #[test]
+    fn unknown_pterodactyl_state_is_not_reflected_into_discord_copy() {
+        let untrusted = "@everyone **injected**";
+
+        let description = pterodactyl_status_description(untrusted);
+        let final_content =
+            start_final_content("abc123", "pterodactyl", untrusted, "MinecraftOnline");
+
+        assert_eq!(
+            description,
+            "Play Hosting returned an unrecognized server state."
+        );
+        assert!(!description.contains(untrusted));
+        assert!(!final_content.contains(untrusted));
     }
 }

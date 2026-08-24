@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -59,6 +59,24 @@ pub struct RunSummary {
     pub steps: Vec<RunStep>,
 }
 
+impl RunSummary {
+    pub fn display_outcome(&self) -> String {
+        if self.background_verification_pending() {
+            format!("{} (verification pending)", self.outcome)
+        } else {
+            self.outcome.clone()
+        }
+    }
+
+    fn background_verification_pending(&self) -> bool {
+        self.steps
+            .iter()
+            .rev()
+            .find(|step| step.step == "minecraft_background_verify")
+            .is_some_and(|step| step.status == "scheduled")
+    }
+}
+
 fn default_provider_name() -> String {
     "aternos".to_string()
 }
@@ -100,8 +118,16 @@ pub struct RunStore {
     limit: usize,
     artifact_dir: Arc<PathBuf>,
     event_file: Arc<PathBuf>,
+    event_write_lock: Arc<StdMutex<()>>,
+    follow_up_lock: Arc<Mutex<()>>,
     persist_events: bool,
     redact_events: bool,
+}
+
+pub struct FollowUpApplyResult {
+    pub summary_updated: bool,
+    pub event_persisted: bool,
+    pub event_error: Option<String>,
 }
 
 impl RunStore {
@@ -116,6 +142,8 @@ impl RunStore {
             limit,
             artifact_dir: Arc::new(artifact_dir.to_path_buf()),
             event_file: Arc::new(artifact_dir.join("events.jsonl")),
+            event_write_lock: Arc::new(StdMutex::new(())),
+            follow_up_lock: Arc::new(Mutex::new(())),
             persist_events,
             redact_events,
         }
@@ -126,6 +154,87 @@ impl RunStore {
         runs.push_front(summary);
         while runs.len() > self.limit {
             runs.pop_back();
+        }
+    }
+
+    pub async fn apply_follow_up(
+        &self,
+        context: RunContext,
+        step: RunStep,
+        outcome: &str,
+        final_provider_status: Option<String>,
+        final_minecraft_status: Option<String>,
+        error_class: Option<String>,
+    ) -> FollowUpApplyResult {
+        let _follow_up_guard = self.follow_up_lock.lock().await;
+        let summary_exists = {
+            let runs = self.inner.lock().await;
+            match runs.iter().find(|run| run.context.run_id == context.run_id) {
+                Some(run) => {
+                    if run.steps.iter().any(|existing| {
+                        existing.step == step.step && existing.status != "scheduled"
+                    }) {
+                        return FollowUpApplyResult {
+                            summary_updated: false,
+                            event_persisted: false,
+                            event_error: None,
+                        };
+                    }
+                    if !run.background_verification_pending() {
+                        return FollowUpApplyResult {
+                            summary_updated: false,
+                            event_persisted: false,
+                            event_error: None,
+                        };
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        let event = RunEvent {
+            context: context.clone(),
+            step: step.clone(),
+        };
+        let store = self.clone();
+        let event_result = tokio::task::spawn_blocking(move || store.append_event(&event))
+            .await
+            .context("run follow-up event writer task failed")
+            .and_then(|result| result);
+        if !summary_exists {
+            return FollowUpApplyResult {
+                summary_updated: false,
+                event_persisted: event_result.is_ok(),
+                event_error: event_result.err().map(|error| error.to_string()),
+            };
+        }
+
+        let mut runs = self.inner.lock().await;
+        let Some(run) = runs
+            .iter_mut()
+            .find(|run| run.context.run_id == context.run_id)
+        else {
+            return FollowUpApplyResult {
+                summary_updated: false,
+                event_persisted: event_result.is_ok(),
+                event_error: event_result.err().map(|error| error.to_string()),
+            };
+        };
+        run.outcome = outcome.to_string();
+        if final_provider_status.is_some() {
+            run.final_provider_status = final_provider_status;
+        }
+        if final_minecraft_status.is_some() {
+            run.final_minecraft_status = final_minecraft_status;
+        }
+        run.error_class = error_class;
+        run.finished_at_ms = step.at_ms;
+        run.duration_ms = step.at_ms.saturating_sub(run.started_at_ms);
+        run.steps.push(step);
+        FollowUpApplyResult {
+            summary_updated: true,
+            event_persisted: event_result.is_ok(),
+            event_error: event_result.err().map(|error| error.to_string()),
         }
     }
 
@@ -159,6 +268,10 @@ impl RunStore {
         if !self.persist_events {
             return Ok(());
         }
+        let _write_guard = self
+            .event_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run event writer lock is poisoned"))?;
 
         if let Some(parent) = self.event_file.parent() {
             ensure_owner_only_dir(parent)?;
@@ -342,7 +455,24 @@ pub fn maintain_event_file_if_needed(artifact_dir: &Path) -> Result<Option<Event
 }
 
 pub fn ensure_owner_only_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "ArtifactWrite: artifact directory is not a safe regular directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!(
+                    "ArtifactWrite: artifact directory is not a safe regular directory: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
     set_owner_only_mode(path, true)
 }
 
@@ -642,6 +772,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn owner_only_directory_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_artifact_dir("directory_symlink");
+        let target = parent.join("target");
+        let link = parent.join("artifact-link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = ensure_owner_only_dir(&link).unwrap_err();
+
+        assert!(error.to_string().contains("not a safe regular directory"));
+        assert!(target.is_dir());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(link).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_artifact_write_replaces_symlink_without_touching_target() {
         use std::os::unix::fs::symlink;
 
@@ -709,6 +864,20 @@ mod tests {
             error_class: failed.then(|| "StartNotAccepted".to_string()),
             steps: Vec::new(),
         }
+    }
+
+    fn sample_pending_summary(run_id: &str, guild_id: Option<&str>) -> RunSummary {
+        let mut summary = sample_summary(run_id, guild_id, false);
+        summary.outcome = "StartRequested".to_string();
+        summary.steps.push(RunStep {
+            at_ms: 3,
+            step: "minecraft_background_verify".to_string(),
+            status: "scheduled".to_string(),
+            detail: None,
+            screenshot_path: None,
+            error_class: None,
+        });
+        summary
     }
 
     fn create_marked_run_dir(dir: &Path, name: &str) -> PathBuf {
@@ -781,6 +950,356 @@ mod tests {
         store.append_event(&sample_event()).unwrap();
 
         assert!(!dir.join("events.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_updates_completed_run_and_persists_terminal_event() {
+        let dir = temp_artifact_dir("follow_up");
+        let store = RunStore::new(10, &dir, true, true);
+        store
+            .push(sample_pending_summary("abc123", Some("guild-1")))
+            .await;
+        let step = RunStep {
+            at_ms: 10,
+            step: "minecraft_background_verify".to_string(),
+            status: "online".to_string(),
+            detail: Some("Online after 8s".to_string()),
+            screenshot_path: None,
+            error_class: None,
+        };
+
+        let result = store
+            .apply_follow_up(
+                sample_context(),
+                step.clone(),
+                "MinecraftOnline",
+                Some("Running".to_string()),
+                Some("Online (1/20 players)".to_string()),
+                None,
+            )
+            .await;
+
+        assert!(result.summary_updated);
+        assert!(result.event_persisted);
+        assert!(result.event_error.is_none());
+        let run = store
+            .find_scoped("abc123", &RunQueryScope::All)
+            .await
+            .unwrap();
+        assert_eq!(run.outcome, "MinecraftOnline");
+        assert_eq!(run.display_outcome(), "MinecraftOnline");
+        assert_eq!(run.final_provider_status.as_deref(), Some("Running"));
+        assert_eq!(
+            run.final_minecraft_status.as_deref(),
+            Some("Online (1/20 players)")
+        );
+        assert_eq!(run.finished_at_ms, 10);
+        assert_eq!(run.duration_ms, 9);
+        assert_eq!(run.steps.len(), 2);
+        assert_eq!(run.steps[1].step, step.step);
+        assert_eq!(run.steps[1].status, step.status);
+        assert_eq!(run.steps[1].detail, step.detail);
+
+        let events = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let event: RunEvent = serde_json::from_str(events.trim()).unwrap();
+        assert_eq!(event.context.run_id, "abc123");
+        assert_eq!(event.step.status, "online");
+        assert_eq!(event.context.user_name, "redacted");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provisional_summary_displays_verification_pending() {
+        let mut run = sample_summary("abc123", Some("guild-1"), false);
+        run.outcome = "StartRequested".to_string();
+        run.steps.push(RunStep {
+            at_ms: 3,
+            step: "minecraft_background_verify".to_string(),
+            status: "scheduled".to_string(),
+            detail: None,
+            screenshot_path: None,
+            error_class: None,
+        });
+
+        assert_eq!(
+            run.display_outcome(),
+            "StartRequested (verification pending)"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_up_is_persisted_when_summary_has_left_memory() {
+        let dir = temp_artifact_dir("follow_up_missing");
+        let store = RunStore::new(1, &dir, true, true);
+        let step = RunStep {
+            at_ms: 10,
+            step: "minecraft_background_verify".to_string(),
+            status: "timeout".to_string(),
+            detail: Some("Timed out".to_string()),
+            screenshot_path: None,
+            error_class: Some("StartVerificationTimeout".to_string()),
+        };
+
+        let result = store
+            .apply_follow_up(
+                sample_context(),
+                step,
+                "StartVerificationTimeout",
+                None,
+                Some("Offline".to_string()),
+                Some("StartVerificationTimeout".to_string()),
+            )
+            .await;
+
+        assert!(!result.summary_updated);
+        assert!(result.event_persisted);
+        assert!(result.event_error.is_none());
+        assert!(dir.join("events.jsonl").is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_follow_up_is_ignored() {
+        let dir = temp_artifact_dir("follow_up_duplicate");
+        let store = RunStore::new(10, &dir, true, true);
+        store
+            .push(sample_pending_summary("abc123", Some("guild-1")))
+            .await;
+        let step = RunStep {
+            at_ms: 10,
+            step: "minecraft_background_verify".to_string(),
+            status: "online".to_string(),
+            detail: Some("Online".to_string()),
+            screenshot_path: None,
+            error_class: None,
+        };
+
+        let first = store
+            .apply_follow_up(
+                sample_context(),
+                step.clone(),
+                "MinecraftOnline",
+                None,
+                Some("Online".to_string()),
+                None,
+            )
+            .await;
+        assert!(first.summary_updated);
+        assert!(first.event_persisted);
+        let duplicate = store
+            .apply_follow_up(
+                sample_context(),
+                step,
+                "MinecraftOnline",
+                None,
+                Some("Online".to_string()),
+                None,
+            )
+            .await;
+        assert!(!duplicate.summary_updated);
+        assert!(!duplicate.event_persisted);
+        assert!(duplicate.event_error.is_none());
+
+        let run = store
+            .find_scoped("abc123", &RunQueryScope::All)
+            .await
+            .unwrap();
+        assert_eq!(run.steps.len(), 2);
+        assert_eq!(
+            fs::read_to_string(dir.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_does_not_overwrite_non_pending_failure() {
+        let dir = temp_artifact_dir("follow_up_failed");
+        let store = RunStore::new(10, &dir, true, true);
+        store
+            .push(sample_summary("abc123", Some("guild-1"), true))
+            .await;
+
+        let result = store
+            .apply_follow_up(
+                sample_context(),
+                RunStep {
+                    at_ms: 10,
+                    step: "minecraft_background_verify".to_string(),
+                    status: "online".to_string(),
+                    detail: Some("Online".to_string()),
+                    screenshot_path: None,
+                    error_class: None,
+                },
+                "MinecraftOnline",
+                None,
+                Some("Online".to_string()),
+                None,
+            )
+            .await;
+
+        assert!(!result.summary_updated);
+        assert!(!result.event_persisted);
+        let run = store
+            .find_scoped("abc123", &RunQueryScope::All)
+            .await
+            .unwrap();
+        assert_eq!(run.outcome, "Failed");
+        assert_eq!(run.error_class.as_deref(), Some("StartNotAccepted"));
+        assert!(!dir.join("events.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_updates_memory_when_persistence_is_disabled() {
+        let dir = temp_artifact_dir("follow_up_no_persistence");
+        let store = RunStore::new(10, &dir, false, true);
+        store
+            .push(sample_pending_summary("abc123", Some("guild-1")))
+            .await;
+
+        let result = store
+            .apply_follow_up(
+                sample_context(),
+                RunStep {
+                    at_ms: 10,
+                    step: "minecraft_background_verify".to_string(),
+                    status: "timeout".to_string(),
+                    detail: Some("Timed out".to_string()),
+                    screenshot_path: None,
+                    error_class: Some("StartVerificationTimeout".to_string()),
+                },
+                "StartVerificationTimeout",
+                None,
+                Some("Offline".to_string()),
+                Some("StartVerificationTimeout".to_string()),
+            )
+            .await;
+
+        assert!(result.summary_updated);
+        assert!(result.event_persisted);
+        assert!(result.event_error.is_none());
+        assert_eq!(
+            store
+                .find_scoped("abc123", &RunQueryScope::All)
+                .await
+                .unwrap()
+                .outcome,
+            "StartVerificationTimeout"
+        );
+        assert!(!dir.join("events.jsonl").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_follow_up_is_not_treated_as_last_error() {
+        let dir = temp_artifact_dir("follow_up_interrupted");
+        let store = RunStore::new(10, &dir, false, true);
+        store
+            .push(sample_pending_summary("abc123", Some("guild-1")))
+            .await;
+
+        store
+            .apply_follow_up(
+                sample_context(),
+                RunStep {
+                    at_ms: 10,
+                    step: "minecraft_background_verify".to_string(),
+                    status: "interrupted".to_string(),
+                    detail: Some("Butler is restarting".to_string()),
+                    screenshot_path: None,
+                    error_class: None,
+                },
+                "StartVerificationInterrupted",
+                None,
+                Some("Offline".to_string()),
+                None,
+            )
+            .await;
+
+        assert!(store.last_error_scoped(&RunQueryScope::All).await.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_follow_up_append_still_finalizes_memory() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_artifact_dir("follow_up_retry");
+        let target = parent.join("target");
+        let artifact_dir = parent.join("artifact-link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &artifact_dir).unwrap();
+        let store = RunStore::new(10, &artifact_dir, true, true);
+        store
+            .push(sample_pending_summary("abc123", Some("guild-1")))
+            .await;
+        let step = RunStep {
+            at_ms: 10,
+            step: "minecraft_background_verify".to_string(),
+            status: "online".to_string(),
+            detail: Some("Online".to_string()),
+            screenshot_path: None,
+            error_class: None,
+        };
+
+        let result = store
+            .apply_follow_up(
+                sample_context(),
+                step,
+                "MinecraftOnline",
+                None,
+                Some("Online".to_string()),
+                None,
+            )
+            .await;
+
+        assert!(result.summary_updated);
+        assert!(!result.event_persisted);
+        assert!(result.event_error.is_some());
+        let completed = store
+            .find_scoped("abc123", &RunQueryScope::All)
+            .await
+            .unwrap();
+        assert_eq!(completed.outcome, "MinecraftOnline");
+        assert_eq!(completed.steps.len(), 2);
+        assert!(!target.join("events.jsonl").exists());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn concurrent_event_appends_remain_separate_json_lines() {
+        let dir = temp_artifact_dir("concurrent_events");
+        let store = RunStore::new(10, &dir, true, true);
+        let writers = (0..4)
+            .map(|writer| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for event_index in 0..25 {
+                        let mut event = sample_event();
+                        event.context.run_id = format!("{writer}-{event_index}");
+                        store.append_event(&event).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let events = fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let parsed = events
+            .lines()
+            .map(serde_json::from_str::<RunEvent>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(parsed.len(), 100);
         fs::remove_dir_all(dir).unwrap();
     }
 

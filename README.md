@@ -95,13 +95,16 @@ cargo run --release -- --provider-start-once
 ```
 
 These commands may run while the LaunchAgent bot is active. They share Butler's cross-process
-start-admission lock, so a provider smoke test and a Discord start cannot overlap. A six-character
+provider-admission lock, so provider smoke tests, Discord starts, and Play Hosting status checks
+cannot overlap. A six-character
 run ID is printed, and diagnostic artifacts follow `ARTIFACT_CAPTURE` under `ARTIFACT_DIR`.
-Pterodactyl smoke tests borrow an already-ready FlareSolverr without stopping it; when no runtime
-is available, the CLI temporarily starts and supervises it, then stops it on normal exit or a
-handled interrupt. On Ctrl-C or SIGTERM, Butler retains admission ownership until the current
-provider result and any required submission verification finish, performs cleanup, and exits
-nonzero. An uncatchable forced kill can still leave local runtime cleanup for the next launch.
+Pterodactyl smoke tests first try the panel directly. Only when Play Hosting presents a fresh
+Cloudflare challenge does Butler borrow an already-ready FlareSolverr or temporarily start and
+supervise it. A Butler-started container is stopped after clearance is cached. On Ctrl-C or
+SIGTERM, Butler retains admission ownership until the current provider result and any required
+submission verification finish, performs cleanup, and exits nonzero. After an uncatchable forced
+kill, the next bot launch reconciles and stops only the exact container generation recorded as
+Butler-owned.
 
 `--provider-check` is read-only with respect to the server host. It does not require
 `DISCORD_TOKEN`, issue allocation wake requests, or issue power requests.
@@ -121,13 +124,14 @@ Install Butler as a per-user LaunchAgent so it starts after login and restarts i
 ./scripts/install-launch-agent.sh
 ```
 
-The installer and Butler share a start-admission lock under the configured `ARTIFACT_DIR`.
-The installer refuses to unload an already-running Butler process while a `/server start`
-provider operation is active, and Butler rejects new starts while installation owns the lock.
-Wait for an active run to finish, then run the installer again. A separate process lock prevents
-two Butler instances from running against the same artifact directory. The LaunchAgent requests
-up to 135 minutes for graceful shutdown, covering the maximum supported allocation and online
-waits plus provider cleanup, though macOS may enforce a shorter system shutdown budget.
+The installer and Butler share a provider-admission lock under the configured `ARTIFACT_DIR`.
+The installer refuses to unload an already-running Butler process while a provider start or Play
+Hosting status check is active, and Butler rejects new provider operations while installation owns
+the lock. Wait for the active operation to finish, then run the installer again. A separate process
+lock prevents two Butler instances from running against the same artifact directory. The
+LaunchAgent plist requests a longer graceful-shutdown window, but current macOS reports an
+effective 60-second exit timeout. Exact-generation ownership markers and startup reconciliation
+provide cleanup recovery if macOS terminates Butler before an on-demand container can stop.
 
 The installer builds the release binary, restricts `.env` to owner-only access, and runs the binary with the repository as its working directory. Re-run the installer after code changes to rebuild and restart the service.
 
@@ -168,7 +172,8 @@ Remove automatic startup without deleting logs or run artifacts:
 | `PTERODACTYL_SERVER_ID` | Pterodactyl server identifier. | Required for Pterodactyl |
 | `PTERODACTYL_API_TOKEN` | Pterodactyl client API token. | Required for Pterodactyl |
 | `PTERODACTYL_POWER_ENABLED` | Allow the provider to issue the start power action. | `false` |
-| `PTERODACTYL_ALLOCATION_WAIT_SECS` | Maximum wait for Play Hosting to allocate a sleeping server before reporting a safe-to-retry timeout. Valid range: 1-3600 seconds. | `1200` |
+| `PTERODACTYL_ALLOCATION_WAIT_SECS` | Initial wait for Play Hosting allocation. Healthy queued/waking progress may continue to the hard cap. Valid range: 1-3600 seconds. | `1200` |
+| `PTERODACTYL_ALLOCATION_MAX_WAIT_SECS` | Hard cap for an extended healthy allocation wait. Must be at least the initial wait and no more than 3600 seconds. | `3600` |
 | `FLARESOLVERR_URL` | Loopback-only FlareSolverr endpoint. | `http://127.0.0.1:8191/` |
 | `FLARESOLVERR_CONTAINER` | Existing isolated Docker container Butler supervises. | `flaresolverr` |
 | `ORBSTACK_BIN` | Optional OrbStack CLI override. | `/opt/homebrew/bin/orbctl` |
@@ -176,11 +181,11 @@ Remove automatic startup without deleting logs or run artifacts:
 | `ATERNOS_USER` / `ATERNOS_PASS` | Browser credentials. | Required for Aternos |
 | `ATERNOS_SERVER_ID` | Optional Aternos server selector. | Empty |
 | `HEADLESS` / `CHROME` | Aternos browser settings. | `true` / auto-detect |
-| `START_WAIT_ONLINE_SECS` | Max wait when `/server start wait_online:true` is used. Valid range: 1-3600 seconds. | `600` |
+| `START_WAIT_ONLINE_SECS` | Max wait for Minecraft to become playable, both for `/server start wait_online:true` and automatic background verification after an accepted Play Hosting start. Valid range: 1-3600 seconds. | `600` |
 | `RUN_HISTORY_LIMIT` | Completed runs retained in memory and newest artifact run directories retained locally. | `20` |
 | `ARTIFACT_DIR` | Local diagnostics directory. | `artifacts/runs` |
 | `ARTIFACT_CAPTURE` | Artifact capture policy: `screenshots`, `full`, `failure`, or `off`. | `screenshots` |
-| `BUTLER_ATTACH_SCREENSHOTS` | Attach saved screenshots in Discord responses when available. Missing files fall back to text. | `true` |
+| `BUTLER_ATTACH_SCREENSHOTS` | Attach saved browser screenshots when available. This applies to Aternos; Pterodactyl responses are text-only. | `true` |
 | `BUTLER_OWNER_IDS` | Comma-separated Discord user IDs authorized for restricted commands. Invalid non-numeric IDs fail startup. | Empty |
 | `BUTLER_PERSIST_RUN_EVENTS` | Write step-level JSONL diagnostics under `ARTIFACT_DIR`. | `true` |
 | `BUTLER_REDACT_RUN_EVENTS` | Redact Discord IDs and names in persisted JSONL events. | `true` |
@@ -191,19 +196,28 @@ Invalid boolean, numeric, owner ID, artifact capture, log level, and color value
 
 ### FlareSolverr Lifecycle
 
-In Pterodactyl mode, Butler starts OrbStack when necessary, starts `flaresolverr`, verifies its loopback readiness endpoint, and keeps it healthy for Butler's process lifetime. A local ownership marker preserves this responsibility across Butler crashes and LaunchAgent restarts. On graceful shutdown Butler stops FlareSolverr only when it owns the container. Butler never stops OrbStack because that would interrupt unrelated containers.
+In Pterodactyl mode, Butler does not start FlareSolverr with the bot. Normal API requests first use the cached Cloudflare clearance, so most provider work has no browser-container overhead. When Play Hosting requests a fresh browser challenge, Butler starts OrbStack if necessary, starts `flaresolverr`, verifies its loopback readiness endpoint, obtains and caches clearance, waits a short cleanup grace period, and stops the container before continuing through the potentially long allocation queue.
+
+If FlareSolverr was already running, Butler borrows it and never stops it. A local owner-only JSON marker records both the container ID and Docker start timestamp, preventing a manually restarted container from being mistaken for a Butler-owned process. Immediately before a start or restart, an interim intent marker records the previous container generation. Butler promotes it only after Docker inspection records the exact new generation; if that inspection never completes, startup leaves the container untouched and logs that manual reconciliation is required. Cancellation drops the operation runtime into the supervisor cleanup path. Butler never stops OrbStack because that would interrupt unrelated containers.
 
 The expected media-stack configuration keeps FlareSolverr behind its own Compose profile, uses restart policy `no`, pins the image by digest, binds host port `8191` only to `127.0.0.1`, and preserves the internal `http://flaresolverr:8191/` endpoint for Prowlarr. Butler validates these properties before starting the configured container and restarts it after a bounded readiness failure. Docker and OrbStack child processes receive a minimal environment without Butler or provider secrets. The API token is sent only by Butler to the exact configured HTTPS panel origin; FlareSolverr receives no API credentials.
 
-For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It waits up to `PTERODACTYL_ALLOCATION_WAIT_SECS` for an active allocation, reports queue phase/position/estimate changes in an ordinary bot message that remains editable during long waits, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag.
+With on-demand mode, Prowlarr or another shared integration can use FlareSolverr only while the
+container happens to be running. Start it manually when those integrations need an always-on
+instance; Butler will detect that externally started instance, borrow it when challenged, and
+leave it running.
+
+For Play Hosting servers in limbo, Butler checks the host's sleep status and uses the wake endpoint with the full UUID only when allocation is not already active. It initially waits up to `PTERODACTYL_ALLOCATION_WAIT_SECS` for an active allocation. If Play Hosting is still returning a valid, unblocked `queued` or `waking` state with no current polling error, Butler extends that same wait once, without another wake request, up to `PTERODACTYL_ALLOCATION_MAX_WAIT_SECS`. During the extension, three consecutive transient polling failures or two minutes without a healthy queue observation end the wait early. The provider estimate is displayed but never controls the deadline. Butler reports queue phase/position/estimate changes in an ordinary bot message that remains editable during long waits, then reads normal Pterodactyl resources and issues one `start` power action when the server is offline. Limbo takes precedence over the generic Pterodactyl suspended flag.
+
+After allocation becomes active, Butler retries the read-only server-controls request up to three total attempts for transport timeouts, connection failures, rate limiting, and provider server errors. These retries never repeat the allocation wake or send power. If all controls reads fail, Discord explicitly says no power command was sent and that retrying `/server start` is safe.
 
 Wake/allocation and power-start uncertainty are tracked separately. A delayed allocation never triggers submission verification because the power request has not happened yet. Each mutating request is issued at most once per command. The power endpoint has a dedicated 60-second response timeout. Ambiguous wake responses are checked through the read-only sleep-status endpoint; ambiguous power responses are checked through Pterodactyl resources and a filtered API activity feed, using the pre-request activity ID as a correlation baseline. If the baseline request fails, Butler falls back to a bounded timestamp comparison. Each provider verification probe is bounded so Minecraft verification still gets time before the deadline. The service-level fallback checks provider state as well as Minecraft for ambiguous power starts, while ambiguous browser starts continue to use Minecraft status. If the allocation deadline expires, running `/server start` again is safe: Butler inspects the current sleep status first and skips wake when the allocation is already `queued`, `waking`, or `active`.
 
-Cloudflare clearance is kept in memory and requested from FlareSolverr with a 180-second challenge budget. A transient FlareSolverr availability failure is retried once before any provider mutation.
+Cloudflare clearance is kept in memory and requested from FlareSolverr with a 180-second challenge budget. Concurrent refreshes are serialized and cache the replacement clearance before another caller can start a duplicate solve. A transient FlareSolverr availability failure is retried once before any provider mutation.
 
 ## Artifact Policy
 
-Artifacts are local diagnostics only and are ignored by git. Screenshots are treated as operational diagnostics so the current browser/dashboard state is easy to inspect locally and, when available, in Discord responses.
+Artifacts are local diagnostics only and are ignored by git. Aternos browser screenshots remain available locally and, when configured, in Discord responses. Pterodactyl uses descriptive Discord text and sanitized JSON state instead of generating or attaching an imitation dashboard screenshot.
 
 `ARTIFACT_CAPTURE` controls local browser artifacts for Aternos:
 
@@ -216,13 +230,17 @@ Artifacts are local diagnostics only and are ignored by git. Screenshots are tre
 
 `events.jsonl` persists step-level run events by default. With `BUTLER_REDACT_RUN_EVENTS=true`, Discord user IDs, user names, guild/channel IDs, and guild/channel names are redacted. On startup, if redaction is enabled and an existing `events.jsonl` appears unredacted, Butler rotates it to `events.unredacted.backup.jsonl`; unreadable or corrupt event logs are quarantined to `events.corrupt.backup.jsonl` before new events are written.
 
-When artifact capture or run-event persistence is enabled, Butler verifies on startup that `ARTIFACT_DIR` can be created, written, and cleaned up. Artifact writes during a run are diagnostic-only: if a screenshot, HTML, or marker file cannot be written, the command continues and logs a warning. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
+After Play Hosting accepts a start, the default `wait_online:false` response returns immediately and Butler verifies Minecraft in the background for up to `START_WAIT_ONLINE_SECS`. `/bot runs` and `/bot run` show the provisional start as `verification pending`, then update it to `MinecraftOnline`, `StartVerificationTimeout`, or `MinecraftStatusError`. A graceful bot shutdown records the non-error outcome `StartVerificationInterrupted` instead of misclassifying the restart as a start failure. When event persistence is enabled, the terminal event is appended to `events.jsonl` with compact status text that excludes Minecraft player names and raw network errors.
+
+This follow-up uses the provider state already observed by the start operation; it does not make another provider request, wake FlareSolverr, edit the Discord message, attach an image, retain the start-admission lock, or replay the start request. The elapsed time in its terminal event is measured from the beginning of the Discord command. Use `wait_online:true` only when the Discord interaction itself should wait for the online result. `/bot` history is memory-only and resets with Butler; when enabled, `events.jsonl` remains the durable operational record.
+
+When artifact capture or run-event persistence is enabled, Butler verifies on startup that `ARTIFACT_DIR` can be created, written, and cleaned up. Browser and provider-state artifact writes during a run are diagnostic-only: if a screenshot, HTML, or state JSON file cannot be written, the command continues and logs a warning. The FlareSolverr ownership marker is operational safety state, so a marker write failure stops the newly started container and fails the provider operation. Artifact run directories created by Butler are pruned by modification time on startup and after every completed run. Butler keeps the newest `RUN_HISTORY_LIMIT` run directories, skips unknown folders, and never prunes `events*.jsonl`.
 
 Butler creates artifact directories with owner-only permissions (`0700`) and artifact/event files with owner-only permissions (`0600`) on Unix. Startup also repairs permissions on recognized existing Butler run directories and `events*.jsonl` files without touching unknown directories or symlinks.
 
-When `ARTIFACT_CAPTURE` is not `off`, Pterodactyl starts write a sanitized `provider_state.json` containing the current workflow stage, provider power state, suspension/limbo flags, the latest allocation phase/queue/connection fields, power submission state (`dispatching`, `ambiguous`, `confirmed`, or `rejected`), confirmation source (`response`, `resources`, or `activity`) when confirmed, and the original sanitized error when an ambiguous response is later confirmed. They also render `provider_snapshot.png`, a fixed diagnostic image derived from a stricter public display model. Every terminal provider failure gets a snapshot even when detailed state could not be fetched. The image is attached to Discord when `BUTLER_ATTACH_SCREENSHOTS=true`; `ARTIFACT_CAPTURE=failure` limits it to failed or still-ambiguous states. Read-only Pterodactyl checks do not write either artifact.
+When `ARTIFACT_CAPTURE` is not `off`, Pterodactyl start operations write a sanitized `provider_state.json` containing the current workflow stage, provider power state, suspension/limbo flags, the latest allocation phase/queue/connection fields, power submission state (`dispatching`, `ambiguous`, `confirmed`, or `rejected`), confirmation source (`response`, `resources`, or `activity`) when confirmed, and the original sanitized error when an ambiguous response is later confirmed. Allocation and post-allocation controls failures also record the failed stage, allowlisted transport category, attempt count, request timeout, elapsed time, and whether a power request was attempted when that fact is known. A `dispatching` artifact deliberately leaves the attempted flag absent until the request outcome is known. Terminal failures write state when no more specific artifact exists. Read-only Pterodactyl checks do not write artifacts.
 
-The Pterodactyl snapshot is not an authenticated dashboard screenshot. FlareSolverr is used only to obtain Cloudflare clearance, and the API token is never injected into a browser session. The image shows only provider state, allocation phase, submission state, mode flags, and an allowlisted error class. If service-level verification resolves an ambiguous submission, Butler replaces the attempted-state image with a confirmed-state image before the final Discord update. Connections, raw errors, authorization, cookies, response bodies, API tokens, server UUIDs, and local paths are excluded from the image. JSON and PNG artifacts are replaced atomically to avoid partial or stale attachments.
+Pterodactyl never injects the API token into a browser session and no longer creates `provider_snapshot.png`. Discord progress describes the equivalent dashboard state in words: allocation asleep, queue position and estimate, host waking, host ready, power request accepted, ambiguous confirmation checks, and already-running or already-starting states.
 
 ## Docker
 
@@ -248,9 +266,9 @@ The Docker runtime supports the Aternos provider and uses Debian with Chromium i
 ## Safety And Privacy
 
 - Never commit `.env`.
-- Runtime artifacts may contain Discord metadata, local paths, screenshots, authenticated Aternos page HTML, or sanitized provider state.
-- Screenshots are kept available by default for operational diagnosis. Because `/server start` is public by design, enabled screenshot attachment may post authenticated dashboard screenshots to the Discord channel where the command is used.
-- HTML is more sensitive, so the default only captures HTML on failure.
+- Runtime artifacts may contain Discord metadata, local paths, Aternos screenshots or authenticated page HTML, or sanitized Pterodactyl provider state.
+- Aternos screenshots are kept available by default for operational diagnosis. Because `/server start` is public by design, enabled Aternos screenshot attachment may post an authenticated dashboard screenshot to the Discord channel where the command is used. Pterodactyl responses are text-only.
+- Aternos HTML is more sensitive, so the default only captures it on failure.
 - Persisted JSONL events redact Discord names and IDs by default. Set `BUTLER_PERSIST_RUN_EVENTS=false` to disable persisted event logs.
 - If runtime artifacts or secrets were ever pushed, clean future commits, prune history deliberately, and rotate affected secrets.
 

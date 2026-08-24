@@ -13,12 +13,10 @@ headless_chrome = "1.0"
 poise = { version = "0.6", default-features = false, features = ["cache", "chrono", "handle_panics"] }
 serde = { version = "1", features = ["derive"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "native_tls_backend"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 dotenvy = "0.15"
 anyhow = "1"
 chrono = "0.4"
-font8x8 = "0.3"
-image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 rand = "0.8"
 craftping = { version = "0.7", features = ["async-tokio"] }

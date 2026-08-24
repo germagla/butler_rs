@@ -1,3 +1,4 @@
+mod background_verification;
 mod queries;
 mod responses;
 mod start;
