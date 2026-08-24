@@ -1082,7 +1082,7 @@ impl PterodactylProvider {
         mut failure: ProviderStartFailure,
         attempted_at: DateTime<Utc>,
         activity_baseline: Option<&str>,
-    ) -> Result<PowerConfirmation, PowerAttemptFailure> {
+    ) -> Result<PowerConfirmation, Box<PowerAttemptFailure>> {
         let deadline = Instant::now() + SUBMISSION_VERIFY_TIMEOUT;
         let mut last_provider_state = None;
         let mut last_verification_error = None;
@@ -1168,10 +1168,10 @@ impl PterodactylProvider {
             last_provider_state.as_deref(),
             last_verification_error.as_deref(),
         );
-        Err(PowerAttemptFailure {
+        Err(Box::new(PowerAttemptFailure {
             failure,
             last_provider_state,
-        })
+        }))
     }
 
     async fn verify_ambiguous_wake(
