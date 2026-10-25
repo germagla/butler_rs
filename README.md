@@ -2,9 +2,19 @@
 
 [![CI](https://github.com/germagla/butler_rs/actions/workflows/ci.yml/badge.svg)](https://github.com/germagla/butler_rs/actions/workflows/ci.yml)
 
-A Rust-powered Discord operations bot for community infrastructure, game-server workflows, diagnostics, and future AI utilities.
+A Rust Discord bot for starting and checking one configured Minecraft server, with diagnostics for investigating failed or uncertain operations.
 
 The repository is named `butler_rs`, but the product identity is Butler. Butler can start one configured Minecraft server through either Play Hosting's Pterodactyl API or the browser-backed Aternos provider.
+
+## Engineering Overview
+
+- **Provider adapters:** Pterodactyl and Aternos share the server-operation interface while keeping their API and browser workflows separate.
+- **Operation coordination:** Cross-process admission locks prevent overlapping provider operations. Cancellation and shutdown retain ownership while verification and cleanup finish.
+- **Failure handling:** An uncertain start response is verified against provider and Minecraft state before reporting a result; retry and verification windows are bounded.
+- **Diagnostics:** Run history, event logs and optional browser artifacts help investigate failures, with command-access restrictions, redaction and retention controls.
+- **Verification:** CI checks dependency advisories, formatting, builds, tests, Clippy and a Docker configuration smoke test.
+
+This version manages a single configured server. The sections below cover setup, architecture and operational limits.
 
 ## Current Features
 

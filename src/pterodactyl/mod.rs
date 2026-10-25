@@ -3391,6 +3391,11 @@ mod tests {
 
     #[tokio::test]
     async fn post_allocation_resource_timeouts_are_classified_and_bounded() {
+        // Leave enough time for the real loopback requests to reach the mock
+        // server under load. Space retries so its delayed response completes
+        // before the next request; only the resource reads should time out.
+        let request_timeout = Duration::from_millis(250);
+        let response_delay = Duration::from_millis(500);
         let details = r#"{"attributes":{"uuid":"34634dd7-e564-480e-a3a7-84baf53c9328","is_suspended":false,"is_limbo":true,"status":null}}"#;
         let resources = r#"{"attributes":{"current_state":"offline","is_suspended":false}}"#;
         let mut responses = vec![
@@ -3412,7 +3417,7 @@ mod tests {
                 "GET /api/client/servers/34634dd7/resources HTTP/1.1",
                 StatusCode::OK,
                 resources,
-                Duration::from_millis(30),
+                response_delay,
             ));
         }
         let (panel_origin, server, requests) = mock_api_recording_with_delays(responses).await;
@@ -3425,10 +3430,11 @@ mod tests {
             artifact_dir.clone(),
             ArtifactCapture::Screenshots,
         );
+        provider.post_allocation_resource_retry_interval = response_delay;
         provider.api_client = Client::builder()
             .redirect(Policy::none())
             .no_proxy()
-            .timeout(Duration::from_millis(5))
+            .timeout(request_timeout)
             .build()
             .unwrap();
 
